@@ -1,152 +1,137 @@
-# Geometry-Aware Message Passing for Molecular Property Prediction
+# How much 3D geometry does a GNN need? Geometry-aware message passing on QM9
 
 <p align="center">
   <img src="assets/molecule.png" width="300">
   <br>
-  <em>Image source: <a href="https://https://www.researchgate.net/publication/377508996_Mode_Collapse_Alleviation_of_Reinforcement_Learning-based_GANs_in_Drug_Design">ResearchGate</a></em>
+  <em>Image source: <a href="https://www.researchgate.net/publication/377508996_Mode_Collapse_Alleviation_of_Reinforcement_Learning-based_GANs_in_Drug_Design">ResearchGate</a></em>
 </p>
 
-This project compares three graph neural network architectures for molecular property prediction on the QM9 dataset, each incorporating 3D geometric information to a different degree. The goal is to study how geometric awareness affects predictive performance, robustness to noise, and resilience to topological bottlenecks in molecular graphs.
+This project measures how much each kind of 3D geometric information helps graph
+neural networks predict quantum-chemical properties of small molecules (QM9). Five
+models form a ladder in which **each step adds exactly one ingredient**, all with the
+same training protocol and a matched parameter budget (~200k):
 
-## Models
-
-- **GIN**: Graph Isomorphism Network. Uses only molecular topology (node features and covalent bond connectivity). No access to 3D coordinates. Serves as the topological baseline.
-- **GINDist**: GIN augmented with interatomic distances. Computes squared Euclidean distances between bonded atoms and concatenates them with bond-type features as edge attributes. E(3)-invariant but not equivariant.
-- **EGNN**: E(n) Equivariant Graph Neural Network (Satorras et al., ICML 2021). Updates both node features and atomic coordinates at each message-passing layer. Maintains full E(3) equivariance through direction-vector-based coordinate updates.
-
-## Target Properties
-
-The models are trained jointly on four molecular properties from QM9, chosen to span a range of geometric dependence:
-
-| Property | Symbol | Description | Geometric dependence |
+| Model | Sees | Symmetry of the prediction | What the step isolates |
 |---|---|---|---|
-| Dipole moment | mu | Separation of positive and negative charges | Medium |
-| Polarizability | alpha | Deformability of the electron cloud | High |
-| HOMO-LUMO gap | gap | Energy difference between frontier orbitals | Low |
-| Heat capacity | Cv | Energy required to raise temperature at constant volume | High |
+| **GIN** | atom features + bond graph | trivially invariant (ignores coordinates) | topology-only baseline |
+| **GINEdge** | + bond types | trivially invariant | value of bond types |
+| **GINDist** | + bond lengths (RBF) | E(3)-invariant | value of distances |
+| **EGNNStatic** | same as GINDist, EGNN-style MPNN | E(3)-invariant | architecture, at equal information |
+| **EGNN** | + equivariant coordinate updates | E(3)-invariant output, equivariant coordinates | value of equivariance (angular information) |
 
-## Project Structure
+Beyond the benchmark, two analyses probe *why* geometry helps:
+
+1. **Noise ablation**: perturb coordinates at inference time (no retraining). GIN and
+   GINEdge never read coordinates, so their flat curves are a built-in sanity check.
+2. **Over-squashing analysis**: Ollivier-Ricci curvature of every bond identifies
+   topological bottlenecks; does the gain over GIN grow with bottleneck severity
+   *after controlling for molecule size*?
+
+## Targets
+
+Four QM9 properties, trained jointly (multi-task) and chosen to span different physics:
+
+| Property | Symbol | Unit | Extensive / intensive |
+|---|---|---|---|
+| Dipole moment | `mu` | D | neither (norm of a vector sum) |
+| Isotropic polarisability | `alpha` | a0^3 | extensive |
+| HOMO-LUMO gap | `gap` | eV | intensive |
+| Heat capacity (298 K) | `Cv` | cal/mol/K | extensive |
+
+## Methodology
+
+- **Random split** 110k / 10k / ~10.8k with a fixed seed (QM9 is stored in GDB
+  enumeration order, so contiguous slices are not i.i.d.). Every model and seed is
+  evaluated on the same molecules.
+- Targets standardised with **train-set statistics only**; loss and model selection in
+  normalised units, so all four targets weigh equally. Results reported in both
+  normalised and physical units.
+- **Shared trunk + per-target heads**: sum- and mean-pooled readout, one small MLP per
+  property (sum suits extensive, mean intensive properties).
+- **Same protocol for all models**: Adam (lr 5e-4), cosine schedule, 300 epochs,
+  batch 96, L1 loss, gradient clipping, early stopping (patience 50); the **best
+  validation checkpoint** is restored before testing.
+- **3 seeds per model**, reported as mean ± std.
+- **Tests** check the properties the design relies on: E(3) invariance of every model
+  (including reflections), permutation invariance, EGNN coordinate equivariance,
+  coordinate-independence of GIN/GINEdge, curvature on hand-computed graphs, split
+  integrity, checkpoint restoration.
+
+## Project structure
 
 ```
 molecular_prediction/
-├── configs/
-│   └── config.py                  # Dataclass-based configuration
+├── main.py                         # CLI entry point (python main.py <command>)
+├── Dockerfile                      # GPU training image (CUDA from the locked wheels)
+├── scripts/dgx_train.sh            # multi-GPU launcher: models x seeds, then analyses
 ├── src/molecular_prediction/
-│   ├── data/
-│   │   ├── dataset.py             # QM9 loading, splitting, normalisation
-│   │   └── transforms.py          # NormaliseTargets, AddGaussianNoise
-│   ├── models/
-│   │   ├── base.py                # Abstract base class for all GNNs
-│   │   ├── gin.py                 # GIN implementation
-│   │   ├── gin_dist.py            # GINDist implementation
-│   │   └── egnn.py                # EGNN implementation
-│   ├── training/
-│   │   ├── trainer.py             # Training loop, evaluation, checkpointing
-│   │   ├── early_stopping.py      # Early stopping logic
-│   │   ├── metrics.py             # Per-target MAE computation
-│   │   └── utils.py               # Checkpoint saving utilities
-│   └── experiments/
-│       ├── main_comparison.py     # Training and evaluation of all models
-│       ├── noise_ablation.py      # Noise robustness experiment
-│       ├── per_molecule_eval.py   # Per-molecule MAE with denormalisation
-│       └── curvature_analysis.py  # Ollivier-Ricci curvature analysis
-├── main.py                        # Entry point for all experiments
-├── models/                        # Saved model checkpoints
-├── results/                       # JSON results files
-├── images/                        # Generated plots
-└── runs/                          # TensorBoard logs
+│   ├── config.py                   # typed dataclass configuration
+│   ├── cli.py                      # commands: params, data, train, compare, noise, curvature, all
+│   ├── data/                       # QM9 loading, random split, normalisation, coordinate noise
+│   ├── models/                     # GIN family, EGNN / EGNNStatic, shared RBF and readout heads
+│   ├── training/                   # trainer, early stopping, metrics, self-contained checkpoints
+│   └── experiments/                # comparison, noise ablation, curvature analysis, plots
+├── tests/                          # pytest suite (runs on CPU in seconds)
+├── results/                        # committed: JSON summaries, per-run metrics, figures
+└── outputs/                        # git-ignored: checkpoints, TensorBoard logs, caches
 ```
 
-## Setup
-
-### Requirements
-
-- Python 3.11+
-- PyTorch 2.8.0+
-- PyTorch Geometric 2.7.0+
-- POT (Python Optimal Transport)
-- NetworkX
-- Matplotlib
-- TensorBoard
-
-### Installation
+## Usage
 
 ```bash
-git clone <repository-url>
-cd molecular_prediction
-uv sync
+uv sync                                   # install (Python 3.11, locked dependencies)
+uv run pytest                             # test-suite
+uv run python main.py params              # parameter count of every model
+uv run python main.py all --smoke --device cpu   # end-to-end check in ~30 s
 ```
 
-The QM9 dataset is downloaded automatically on the first run.
-
-## Experiments
-
-The project includes three experiments, each runnable from the command line.
-
-### Main Comparison
-
-Trains all three models (GIN, GINDist, EGNN) on the QM9 dataset with identical hyperparameters and evaluates them on the test set. Produces training curves, per-target validation curves, and test MAE bar charts.
+Full pipeline on a single machine:
 
 ```bash
-python main.py --experiment main_comparison --device cuda
+uv run python main.py train --device cuda          # 5 models x 3 seeds
+uv run python main.py compare                      # results/comparison.json + figures
+uv run python main.py noise --device cuda          # results/noise_ablation.json
+uv run python main.py curvature --device cuda      # results/curvature_analysis.json
 ```
 
-Outputs:
-- Model checkpoints in `models/`
-- Training curves in `images/`
-- Test MAE comparison plots in `images/`
-- Numerical results in `results/comparison_results.json`
-- TensorBoard logs in `runs/`
+`train` skips runs whose results already exist, so it can be resumed after an
+interruption (`--overwrite` forces retraining). TensorBoard: `tensorboard --logdir outputs/runs`.
 
-### Noise Ablation
+### On a multi-GPU server (e.g. NVIDIA DGX) with Docker
 
-Evaluates the pretrained models on test sets with increasing levels of Gaussian noise added to atomic coordinates. No retraining is performed. This experiment measures how each architecture's use of geometric information affects its sensitivity to coordinate perturbations. GIN serves as a control since it does not use coordinates.
+Requirements on the host: NVIDIA driver (>= 570 recommended for CUDA 12.8) and the
+NVIDIA Container Toolkit.
 
 ```bash
-python main.py --experiment noise_ablation --device cuda
+git clone <repository-url> && cd molecular_prediction
+GPUS="0 1 2 3" JOBS_PER_GPU=2 scripts/dgx_train.sh
 ```
 
-Noise levels: sigma = 0.0, 0.1, 0.25, 0.5, 1.0 angstrom.
-
-Outputs:
-- Combined and per-target noise ablation curves in `images/`
-- Numerical results in `results/noise_ablation_results.json`
-
-### Curvature Analysis
-
-Performs an analysis of over-squashing using Ollivier-Ricci curvature. For each molecule in the test set, computes the curvature of every edge in the covalent bond graph, assigns molecules to quartiles by minimum curvature (a representation of bottleneck severity), and compares model errors across quartiles. Tests whether the advantage of EGNN over GIN grows in molecules with more severe topological bottlenecks.
+The script builds the image, downloads QM9 once, trains every (model, seed) pair in
+parallel across the listed GPUs, then runs the three analyses. Containers run as your
+user, with `data/`, `outputs/` and `results/` bind-mounted, so everything persists on
+the host. Afterwards commit `results/` to bring the numbers and figures back:
 
 ```bash
-python main.py --experiment curvature_analysis --device cuda
+git add results && git commit -m "Add DGX results" && git push
 ```
 
-Outputs:
-- Curvature distribution plots in `images/`
-- MAE by quartile plots (combined and per-target) in `images/`
-- Relative improvement of EGNN over GIN by quartile in `images/`
-- Numerical results in `results/curvature_analysis_results.json`
+## Results
 
-## Configuration
-
-All hyperparameters are defined in `configs/config.py` using Python dataclasses:
-
-| Parameter | Value |
-|---|---|
-| Hidden dimension | 128 |
-| Message passing layers | 4 |
-| Learning rate | 1e-3 |
-| Batch size | 32 |
-| Epochs | 150 |
-| Scheduler | Cosine annealing |
-| Train / Val / Test split | 110,000 / 10,000 / ~10,831 |
+Generated in `results/` after training: `comparison.json`, `noise_ablation.json`,
+`curvature_analysis.json`, per-run `results/runs/<model>/seed_<s>/{metrics,history}.json`
+and the figures in `results/figures/`.
 
 ## References
 
-- Satorras, V. G., Hoogeboom, E., & Welling, M. (2021). E(n) Equivariant Graph Neural Networks. ICML.
-- Xu, K., Hu, W., Leskovec, J., & Jegelka, S. (2019). How Powerful are Graph Neural Networks? ICLR.
-- Ramakrishnan, R., Dral, P. O., Rupp, M., & von Lilienfeld, O. A. (2014). Quantum chemistry structures and properties of 134 kilo molecules. Scientific Data.
-- Topping, J., Di Giovanni, F., Chamberlain, B. P., Dong, X., & Bronstein, M. M. (2022). Understanding Over-Squashing and Bottlenecks on Graphs via Curvature. ICLR.
-- Alon, U., & Yahav, E. (2021). On the Bottleneck of Graph Neural Networks and its Practical Implications. ICLR.
+- Satorras, Hoogeboom & Welling (2021). *E(n) Equivariant Graph Neural Networks.* ICML.
+- Xu, Hu, Leskovec & Jegelka (2019). *How Powerful are Graph Neural Networks?* ICLR.
+- Hu et al. (2020). *Strategies for Pre-training Graph Neural Networks.* ICLR (GINE).
+- Schütt et al. (2017). *SchNet: A continuous-filter convolutional neural network for modeling quantum interactions.* NeurIPS (RBF distance expansion).
+- Ramakrishnan, Dral, Rupp & von Lilienfeld (2014). *Quantum chemistry structures and properties of 134 kilo molecules.* Scientific Data.
+- Alon & Yahav (2021). *On the Bottleneck of Graph Neural Networks and its Practical Implications.* ICLR.
+- Topping et al. (2022). *Understanding Over-Squashing and Bottlenecks on Graphs via Curvature.* ICLR.
+- Ollivier (2009). *Ricci curvature of Markov chains on metric spaces.* Journal of Functional Analysis.
 
 ## Authorship
 

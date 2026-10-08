@@ -1,88 +1,49 @@
-# src/molecular_prediction/models/base.py
+"""Common interface of every model: encode atoms, then read out properties."""
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
-from torch_geometric.nn import global_add_pool
+
+from molecular_prediction.data.dataset import NODE_FEATURE_DIM
+from molecular_prediction.models.layers import MultiTaskHead
 
 
-class BaseGNN(ABC, nn.Module):
-    """Abstract base class for all GNN models in the project.
-    Defines the shared structure: node embedding, message passing layers,
-    coordinate update (optional), global readout, and prediction head.
+class MolecularGNN(nn.Module, ABC):
+    """Template for all models.
+
+    Subclasses only implement :meth:`encode`, which turns a (batched) molecular
+    graph into per-atom embeddings. The atom embedding and the readout head are
+    shared code, so any difference between models comes from the encoder,
+    which is precisely the variable under study.
 
     Args:
-        hidden_dim: Dimensionality of node embeddings.
-        num_layers: Number of message passing layers.
-        num_targets: Number of target properties to predict.
+        hidden_dim: Width of the atom embeddings.
+        num_targets: Number of properties predicted jointly.
     """
 
-    def __init__(self, hidden_dim: int, num_layers: int, num_targets: int) -> None:
+    #: Whether the model reads ``data.pos``. Used by the tests and the noise
+    #: ablation: a model that does not use coordinates must be unaffected by them.
+    uses_coordinates: ClassVar[bool]
+
+    def __init__(self, hidden_dim: int, num_targets: int) -> None:
         super().__init__()
         self.hidden_dim: int = hidden_dim
-        self.num_layers: int = num_layers
-        self.num_targets: int = num_targets
-
-        self.node_embedding: nn.Module = None  # to be defined in subclass __init__
-        self.layers: nn.ModuleList = nn.ModuleList()
-        self.prediction_head: nn.Module = None  # to be defined in subclass __init__
+        self.atom_embedding: nn.Linear = nn.Linear(NODE_FEATURE_DIM, hidden_dim)
+        self.head: MultiTaskHead = MultiTaskHead(hidden_dim, num_targets)
 
     @abstractmethod
-    def message_pass(
-        self,
-        h: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Run one message passing step and return updated node features.
-
-        Args:
-            h: Node feature matrix of shape [num_nodes, hidden_dim].
-            edge_index: Graph connectivity of shape [2, num_edges].
-            edge_attr: Edge feature matrix of shape [num_edges, edge_dim], optional.
-
-        Returns:
-            Updated node features of shape [num_nodes, hidden_dim].
-        """
-        pass
-
-    def update_coords(
-        self,
-        pos: torch.Tensor,
-        edge_index: torch.Tensor,
-        messages: torch.Tensor,
-    ) -> torch.Tensor:
-        """Update 3D coordinates using aggregated messages.
-        Default implementation is a no-op — only overridden by EGNN.
-
-        Args:
-            pos: Atomic coordinates of shape [num_nodes, 3].
-            edge_index: Graph connectivity of shape [2, num_edges].
-            messages: Message tensor of shape [num_edges, hidden_dim].
-
-        Returns:
-            Updated coordinates of shape [num_nodes, 3].
-        """
-        return pos
+    def encode(self, data: Data) -> torch.Tensor:
+        """Return per-atom embeddings of shape [num_nodes, hidden_dim]."""
 
     def forward(self, data: Data) -> torch.Tensor:
-        """Forward pass shared by the two simple models models.
-
-        Args:
-            data: PyG Data object containing node features, edge index,
-                  edge attributes and optionally 3D coordinates.
-
-        Returns:
-            Predicted targets of shape [num_graphs, num_targets].
-        """
-        h: torch.Tensor = self.node_embedding(data.x)
-        edge_index: torch.Tensor = data.edge_index
-        edge_attr: Optional[torch.Tensor] = data.edge_attr
-
-        h = self.message_pass(h, edge_index, edge_attr)
-        graph_repr = global_add_pool(h, data.batch)
-        out = self.prediction_head(graph_repr)
-        return out
+        """Predict normalised targets, shape [num_graphs, num_targets]."""
+        h: torch.Tensor = self.encode(data)
+        batch: torch.Tensor = (
+            data.batch
+            if data.batch is not None
+            else torch.zeros(data.num_nodes, dtype=torch.long, device=h.device)
+        )
+        return self.head(h, batch)

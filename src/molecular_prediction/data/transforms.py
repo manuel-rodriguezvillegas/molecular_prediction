@@ -1,63 +1,53 @@
-# src/molecular_prediction/data/transforms.py
+"""Per-molecule and per-batch data transforms."""
+
+import copy
 
 import torch
-from torch_geometric.data import Data
+from torch_geometric.data import Batch, Data
+from torch_geometric.transforms import BaseTransform
 
 
-class NormaliseTargets:
-    """Normalise molecular property targets using precomputed statistics.
-    Applied on-the-fly when accessing dataset elements.
+class SelectAndNormaliseTargets(BaseTransform):
+    """Keep only the selected QM9 targets and standardise them.
+
+    Applied lazily on every ``dataset[i]``. The operation is out-of-place on
+    purpose: PyG caches Data objects that share storage with the dataset, so
+    writing into ``data.y`` in place would silently corrupt the cache.
 
     Args:
-        stats: Dictionary mapping target index to {"mean": ..., "std": ...}.
-        target_indices: List of target indices to normalise.
+        target_indices: QM9 columns to keep.
+        mean: Per-target mean of the training split, shape [num_targets].
+        std: Per-target standard deviation of the training split.
     """
 
-    def __init__(
-        self, stats: dict[int, dict[str, torch.Tensor]], target_indices: list[int]
-    ) -> None:
-        self.stats: dict[int, dict[str, torch.Tensor]] = stats
-        self.target_indices: list[int] = target_indices
+    def __init__(self, target_indices: list[int], mean: torch.Tensor, std: torch.Tensor) -> None:
+        self.target_indices: list[int] = list(target_indices)
+        self.mean: torch.Tensor = mean
+        self.std: torch.Tensor = std
 
-    def __call__(self, data: Data) -> Data:
-        """
-        Normalise the targets of a single molecule.
-
-        Args:
-            data: PyG Data object for a single molecule.
-
-        Returns:
-            Data object with normalised targets.
-        """
-        data = data.clone()
-        for idx in self.target_indices:
-            data.y[0, idx] = (data.y[0, idx] - self.stats[idx]["mean"]) / (
-                self.stats[idx]["std"] + 1e-6
-            )
+    def forward(self, data: Data) -> Data:
+        """Replace ``data.y`` [1, 19] by its normalised selection [1, num_targets]."""
+        data.y = (data.y[:, self.target_indices] - self.mean) / self.std
         return data
 
 
-class AddGaussianNoise:
-    """Add isotropic Gaussian noise to 3D atomic coordinates.
-    Used for the noise robustness ablation experiment.
+def add_coordinate_noise(batch: Batch, sigma: float, generator: torch.Generator) -> Batch:
+    """Return a copy of ``batch`` with isotropic Gaussian noise on ``pos``.
+
+    The noise is drawn on the CPU from an explicit generator, so for a fixed
+    seed and a fixed (unshuffled) loader every model sees exactly the same
+    perturbed geometries. That turns the noise ablation into a paired
+    comparison between models.
 
     Args:
-        sigma: Standard deviation of the Gaussian noise.
+        batch: Batch of molecules.
+        sigma: Standard deviation of the noise, in Angstrom.
+        generator: CPU random generator.
+
+    Returns:
+        A shallow copy of the batch whose ``pos`` has been perturbed.
     """
-
-    def __init__(self, sigma: float) -> None:
-        self.sigma: float = sigma
-
-    def __call__(self, data: Data) -> Data:
-        """Add noise to the 3D coordinates of a single molecule.
-
-        Args:
-            data: PyG Data object for a single molecule.
-
-        Returns:
-            Data object with perturbed coordinates.
-        """
-        noise: torch.Tensor = torch.randn_like(data.pos) * self.sigma
-        data.pos = data.pos + noise
-
-        return data
+    noise: torch.Tensor = torch.randn(batch.pos.shape, generator=generator, dtype=batch.pos.dtype)
+    noisy: Batch = copy.copy(batch)  # shares every tensor except the new pos
+    noisy.pos = batch.pos + sigma * noise.to(batch.pos.device)
+    return noisy

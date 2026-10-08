@@ -1,0 +1,15 @@
+.git
+.venv
+.github
+.ruff_cache
+.pytest_cache
+**/__pycache__
+data
+outputs
+outputs_smoke
+results
+tests
+assets
+*.md
+!README.md
+.DS_Store

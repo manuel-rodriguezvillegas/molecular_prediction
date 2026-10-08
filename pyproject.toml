@@ -1,27 +1,38 @@
 [project]
 name = "molecular-prediction"
-version = "0.1.0"
-description = "Comparing E(3) equivariance in GNNs on QM9"
+version = "0.2.0"
+description = "How much 3D geometry does a GNN need? GIN vs E(3)-invariant vs E(3)-equivariant models on QM9"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "torch",
-    "torch-geometric",
+    "torch>=2.8",
+    "torch-geometric>=2.7",
     "tensorboard",
     "matplotlib",
     "networkx",
+    "numpy",
     "pot",
 ]
 
+[project.scripts]
+molpred = "molecular_prediction.cli:main"
+
 [dependency-groups]
 dev = [
+    "pytest",
     "ruff",
     "jupyter",
 ]
 
 [tool.ruff]
-line-length = 88
-select = ["E", "F", "I"]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.uv]
 package = true

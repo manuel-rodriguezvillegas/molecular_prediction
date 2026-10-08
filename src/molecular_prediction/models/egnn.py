@@ -1,196 +1,145 @@
-# src/molecular_prediction/models/egnn.py
+"""E(n) Equivariant Graph Neural Network (Satorras, Hoogeboom & Welling, ICML 2021).
 
-from typing import Optional
+For an edge j -> i, one layer computes
+
+    m_ij      = phi_e(h_i, h_j, RBF(||x_i - x_j||), a_ij)
+    h_i'      = h_i + phi_h(h_i, sum_j m_ij)
+    x_i'      = x_i + mean_j  (x_i - x_j) / (||x_i - x_j|| + 1) * phi_x(m_ij)
+
+Messages depend only on invariants, so ``h`` is E(3)-invariant; coordinates move
+only along relative-position vectors scaled by invariant scalars, so ``x`` is
+E(3)-equivariant. The readout uses ``h`` alone, hence predictions are invariant.
+
+Two variants are exposed:
+
+* ``EGNN``       - coordinates are updated (equation above).
+* ``EGNNStatic`` - coordinates are frozen. It is then an invariant MPNN over
+  bond lengths, i.e. it sees exactly the same information as ``GINDist``. The
+  EGNNStatic -> EGNN comparison isolates the effect of the equivariant
+  coordinate update, which is the only way this model can access angular
+  information on a bond graph.
+
+Deviations from the paper, all deliberate: the graph is the covalent-bond graph
+instead of a fully connected one (same topology for every model, required by
+the curvature study); distances are RBF-expanded (same featurisation as
+GINDist); predictions are multi-task with per-target heads.
+"""
+
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
-from torch_geometric.nn import MessagePassing, global_add_pool
 from torch_geometric.utils import scatter
 
-from src.molecular_prediction.models.base import BaseGNN
+from molecular_prediction.data.dataset import EDGE_FEATURE_DIM
+from molecular_prediction.models.base import MolecularGNN
+from molecular_prediction.models.layers import RadialBasis, edge_vectors, mlp
 
-NODE_FEATURE_DIM: int = 11
 
+class EGNNLayer(nn.Module):
+    """One E(n)-equivariant message passing layer.
 
-class EGNNConv(MessagePassing):
-    """Single EGNN message passing layer.
-    Updates both node features h and coordinates x equivariantly.
+    Messages are computed once and reused for both the feature update and the
+    coordinate update, with a single ``target = edge_index[1]`` convention.
 
     Args:
-        hidden_dim: Dimensionality of node embeddings.
-        edge_attr_dim: Dimensionality of edge features.
+        hidden_dim: Width of the atom embeddings.
+        num_rbf: Size of the radial basis expansion.
+        update_coords: Whether this layer moves the atoms.
     """
 
-    def __init__(self, hidden_dim: int, edge_attr_dim: int) -> None:
-        super().__init__(aggr="sum")
-
-        self.phi_e: nn.Module = nn.Sequential(
-            nn.Linear(2 * hidden_dim + 1 + edge_attr_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+    def __init__(self, hidden_dim: int, num_rbf: int, update_coords: bool) -> None:
+        super().__init__()
+        self.update_coords: bool = update_coords
+        self.phi_e: nn.Sequential = mlp(
+            2 * hidden_dim + num_rbf + EDGE_FEATURE_DIM,
+            hidden_dim,
+            hidden_dim,
+            final_activation=True,
         )
-        self.phi_x: nn.Linear = nn.Linear(hidden_dim, 1)
-        self.phi_h: nn.Module = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    def _compute_edge_messages(
-        self,
-        h: torch.Tensor,
-        pos: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Compute phi_e messages for a given set of edges."""
-        h_i: torch.Tensor = h[edge_index[0]]
-        h_j: torch.Tensor = h[edge_index[1]]
-        pos_i: torch.Tensor = pos[edge_index[0]]
-        pos_j: torch.Tensor = pos[edge_index[1]]
-
-        dist_sq: torch.Tensor = ((pos_i - pos_j) ** 2).sum(dim=1, keepdim=True)
-        inputs: torch.Tensor = torch.cat([h_i, h_j, dist_sq, edge_attr], dim=1)
-        return self.phi_e(inputs)
-
-    def _compute_coord_update(
-        self,
-        h: torch.Tensor,
-        pos: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Compute equivariant coordinate displacement."""
-        messages: torch.Tensor = self._compute_edge_messages(
-            h, pos, edge_index, edge_attr
-        )
-        direction_vectors: torch.Tensor = pos[edge_index[0]] - pos[edge_index[1]]
-        scaled: torch.Tensor = direction_vectors * self.phi_x(messages)
-        return scatter(scaled, edge_index[0], dim=0, dim_size=pos.size(0), reduce="sum")
+        self.phi_h: nn.Sequential = mlp(2 * hidden_dim, hidden_dim, hidden_dim)
+        self.phi_x: nn.Sequential | None = None
+        if update_coords:
+            self.phi_x = mlp(hidden_dim, hidden_dim, 1)
+            # Start with near-zero displacements (as in the reference code), so
+            # early training does not scramble the geometry it relies on.
+            nn.init.xavier_uniform_(self.phi_x[-1].weight, gain=1e-3)
+            nn.init.zeros_(self.phi_x[-1].bias)
 
     def forward(
         self,
         h: torch.Tensor,
         pos: torch.Tensor,
         edge_index: torch.Tensor,
-        edge_attr: Optional[torch.Tensor] = None,
+        edge_attr: torch.Tensor,
+        rbf: RadialBasis,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run one EGNN layer updating both node features and coordinates.
+        """Update atom embeddings and (optionally) coordinates.
 
         Args:
-            h: Node features of shape [num_nodes, hidden_dim].
-            pos: Atomic coordinates of shape [num_nodes, 3].
-            edge_index: Graph connectivity of shape [2, num_edges].
-            edge_attr: Edge features of shape [num_edges, edge_attr_dim].
+            h: Atom embeddings [num_nodes, hidden_dim].
+            pos: Coordinates [num_nodes, 3].
+            edge_index: Directed edges [2, num_edges], source -> target.
+            edge_attr: Bond-type one-hot [num_edges, 4].
+            rbf: Radial basis shared by all layers.
 
         Returns:
-            Tuple of (updated h, updated pos), both with same shape as input.
+            Updated (h, pos) with unchanged shapes.
         """
-        # First pass: compute edge messages and aggregate for node update
-        h_updated: torch.Tensor = self.propagate(
-            edge_index, h=h, pos=pos, edge_attr=edge_attr
+        source, target = edge_index
+        rel, dist = edge_vectors(pos, edge_index)
+
+        messages: torch.Tensor = self.phi_e(
+            torch.cat([h[target], h[source], rbf(dist), edge_attr], dim=-1)
         )
-
-        # Second pass: compute coordinate displacements
-        coord_update: torch.Tensor = self._compute_coord_update(
-            h, pos, edge_index, edge_attr
+        aggregated: torch.Tensor = scatter(
+            messages, target, dim=0, dim_size=h.size(0), reduce="sum"
         )
-        pos_updated: torch.Tensor = pos + coord_update
+        h = h + self.phi_h(torch.cat([h, aggregated], dim=-1))
 
-        return h_updated, pos_updated
+        if self.phi_x is not None:
+            # Normalising by (d + 1) bounds each step even for distant pairs;
+            # averaging over neighbours makes it independent of the degree.
+            displacement: torch.Tensor = rel / (dist + 1.0) * self.phi_x(messages)
+            pos = pos + scatter(displacement, target, dim=0, dim_size=pos.size(0), reduce="mean")
 
-    def message(
-        self,
-        h_i: torch.Tensor,
-        h_j: torch.Tensor,
-        pos_i: torch.Tensor,
-        pos_j: torch.Tensor,
-        edge_attr: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Compute messages m_ij using phi_e.
-
-        Args:
-            h_i: Features of target nodes of shape [num_edges, hidden_dim].
-            h_j: Features of source nodes of shape [num_edges, hidden_dim].
-            pos_i: Coordinates of target nodes of shape [num_edges, 3].
-            pos_j: Coordinates of source nodes of shape [num_edges, 3].
-            edge_attr: Edge features of shape [num_edges, edge_attr_dim].
-
-        Returns:
-            Messages of shape [num_edges, hidden_dim].
-        """
-        dist_sq: torch.Tensor = ((pos_i - pos_j) ** 2).sum(dim=1, keepdim=True)
-        inputs: torch.Tensor = torch.cat([h_i, h_j, dist_sq, edge_attr], dim=1)
-        return self.phi_e(inputs)
-
-    def update(self, aggr_out: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """Update node features using phi_h.
-
-        Args:
-            aggr_out: Aggregated messages of shape [num_nodes, hidden_dim].
-            h: Current node features of shape [num_nodes, hidden_dim].
-
-        Returns:
-            Updated node features of shape [num_nodes, hidden_dim].
-        """
-        return self.phi_h(torch.cat([h, aggr_out], dim=1))
+        return h, pos
 
 
-class EGNN(BaseGNN):
-    """E(3)-equivariant GNN using EGNN layers (Satorras et al., ICML 2021).
-    Updates both node features and 3D coordinates equivariantly.
+class EGNN(MolecularGNN):
+    """EGNN that updates the coordinates at every layer."""
 
-    Args:
-        hidden_dim: Dimensionality of node embeddings.
-        num_layers: Number of EGNN layers.
-        num_targets: Number of target properties to predict.
-        edge_attr_dim: Dimensionality of the original QM9 edge features.
-    """
+    uses_coordinates: ClassVar[bool] = True
+    update_coords: ClassVar[bool] = True
 
     def __init__(
         self,
         hidden_dim: int,
         num_layers: int,
         num_targets: int,
-        edge_attr_dim: int,
+        num_rbf: int,
+        rbf_cutoff: float,
     ) -> None:
-        super().__init__(hidden_dim, num_layers, num_targets)
+        super().__init__(hidden_dim, num_targets)
+        self.rbf: RadialBasis = RadialBasis(num_rbf, rbf_cutoff)
+        self.layers: nn.ModuleList = nn.ModuleList(
+            EGNNLayer(hidden_dim, num_rbf, self.update_coords) for _ in range(num_layers)
+        )
 
-        self.node_embedding: nn.Module = nn.Linear(NODE_FEATURE_DIM, hidden_dim)
+    def encode(self, data: Data) -> torch.Tensor:
+        return self.encode_with_coordinates(data)[0]
 
-        for _ in range(num_layers):
-            self.layers.append(EGNNConv(hidden_dim, edge_attr_dim))
-
-        self.prediction_head: nn.Module = nn.Linear(hidden_dim, num_targets)
-
-    def message_pass(
-        self,
-        h: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Not used — EGNN overrides forward directly."""
-        raise NotImplementedError("EGNN overrides forward, message_pass is not called.")
-
-    def forward(self, data: Data) -> torch.Tensor:
-        """Full EGNN forward pass with coordinate updates.
-
-        Args:
-            data: PyG Data object with node features, edge index,
-                  edge attributes and 3D coordinates.
-
-        Returns:
-            Predicted targets of shape [num_graphs, num_targets].
-        """
-        h: torch.Tensor = self.node_embedding(data.x)
+    def encode_with_coordinates(self, data: Data) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run every layer and also return the final (equivariant) coordinates."""
+        h: torch.Tensor = self.atom_embedding(data.x)
         pos: torch.Tensor = data.pos
-        edge_index: torch.Tensor = data.edge_index
-        edge_attr: Optional[torch.Tensor] = data.edge_attr
-
         for layer in self.layers:
-            h, pos = layer(h, pos, edge_index, edge_attr)
+            h, pos = layer(h, pos, data.edge_index, data.edge_attr, self.rbf)
+        return h, pos
 
-        graph_repr: torch.Tensor = global_add_pool(h, data.batch)
-        return self.prediction_head(graph_repr)
+
+class EGNNStatic(EGNN):
+    """EGNN with frozen coordinates: an E(3)-invariant MPNN over bond lengths."""
+
+    update_coords: ClassVar[bool] = False

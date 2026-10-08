@@ -1,6 +1,13 @@
-# src/molecular_prediction/training/trainer.py
+"""Model-agnostic training loop.
 
-import os
+All models go through this exact loop (same optimiser, schedule, loss, data
+order and checkpoint policy), so differences between them cannot come from
+differences in training code.
+"""
+
+import logging
+import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -10,231 +17,262 @@ from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 
-from src.molecular_prediction.models.base import BaseGNN
-from src.molecular_prediction.training.early_stopping import EarlyStopping
-from src.molecular_prediction.training.utils import save_parameters
+from molecular_prediction.config import TARGET_NAMES, Config, LossName
+from molecular_prediction.data.dataset import TargetStats
+from molecular_prediction.models import MolecularGNN
+from molecular_prediction.training.checkpoint import (
+    CHECKPOINT_NAME,
+    save_checkpoint,
+)
+from molecular_prediction.training.metrics import MAEAccumulator
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+History = dict[str, list[float] | dict[str, list[float]]]
+
+
+def build_loss(name: LossName) -> nn.Module:
+    """Training objective, applied in normalised target space.
+
+    * ``l1``: MAE, the QM9 evaluation metric; robust to outliers but its
+      gradient has constant magnitude, so it does not slow down near the optimum.
+    * ``smooth_l1``: Huber with delta = 1 (one standard deviation): quadratic for
+      small errors (smooth convergence), linear for large ones (robust).
+    * ``mse``: penalises large errors heavily; sensitive to outliers.
+    """
+    losses: dict[str, nn.Module] = {
+        "l1": nn.L1Loss(),
+        "smooth_l1": nn.SmoothL1Loss(beta=1.0),
+        "mse": nn.MSELoss(),
+    }
+    return losses[name]
+
+
+def make_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    seed: int = 0,
+) -> DataLoader:
+    """DataLoader with worker processes and a seeded shuffling order."""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
+        generator=torch.Generator().manual_seed(seed) if shuffle else None,
+    )
+
+
+class EarlyStopping:
+    """Track the best validation score and stop after ``patience`` stale epochs.
+
+    Args:
+        patience: Epochs without improvement before stopping; ``None`` disables
+            stopping (the best score is still tracked).
+        min_delta: Minimum decrease that counts as an improvement.
+    """
+
+    def __init__(self, patience: int | None, min_delta: float) -> None:
+        self.patience: int | None = patience
+        self.min_delta: float = min_delta
+        self.best: float = float("inf")
+        self.stale_epochs: int = 0
+
+    def step(self, value: float) -> bool:
+        """Register a new validation score; return whether it is a new best."""
+        if value < self.best - self.min_delta:
+            self.best = value
+            self.stale_epochs = 0
+            return True
+        self.stale_epochs += 1
+        return False
+
+    @property
+    def should_stop(self) -> bool:
+        return self.patience is not None and self.stale_epochs >= self.patience
 
 
 class Trainer:
-    """Generic trainer for GNN models on QM9.
-    Handles training loop, evaluation, checkpointing and TensorBoard logging.
+    """Train one model with the shared protocol and keep its best checkpoint.
 
     Args:
-        model: GNN model to train.
-        model_name: Model identifier, used to name checkpoint and TensorBoard run.
-        train_dataset: Training dataset.
-        val_dataset: Validation dataset.
-        lr: Learning rate.
-        batch_size: Number of graphs per batch.
-        patience: Early stopping patience (epochs without improvement).
-        delta: Minimum improvement threshold for early stopping.
-        epochs: Maximum number of training epochs.
-        device: Device to train on ('cpu', 'cuda', 'mps').
-        target_indices: QM9 column indices for the targets to predict.
-        path_weights: Directory where model checkpoints are saved (default: 'models').
-            The actual file will be '{path_weights}/{model_name}.pt'.
-        output_dir: Directory for TensorBoard logs (default: 'runs').
-            Logs are written to '{output_dir}/{model_name}'.
+        model: Untrained model.
+        model_name: Registry name of the model.
+        train_dataset: Training split (normalised targets).
+        val_dataset: Validation split, used for model selection only.
+        stats: Normalisation statistics, stored in the checkpoint.
+        config: Full configuration.
+        device: Device to train on.
+        output_dir: Run directory (checkpoint and TensorBoard logs).
+        seed: Seed of the shuffling order (weights are seeded by the caller).
     """
 
     def __init__(
         self,
-        model: BaseGNN,
+        model: MolecularGNN,
         model_name: str,
         train_dataset: Dataset,
         val_dataset: Dataset,
-        lr: float,
-        batch_size: int,
-        patience: int,
-        delta: float,
-        epochs: int,
-        device: str,
-        target_indices: list[int],
-        target_names: list[str] | None = None,
-        path_weights: str = "models",
-        output_dir: str = "runs",
+        stats: TargetStats,
+        config: Config,
+        device: torch.device,
+        output_dir: Path,
+        seed: int,
     ) -> None:
-        self.model: nn.Module = model
+        self.model: MolecularGNN = model.to(device)
         self.model_name: str = model_name
-        self.train_dataset: Dataset = train_dataset
-        self.val_dataset: Dataset = val_dataset
-        self.lr: float = lr
-        self.batch_size: int = batch_size
-        self.epochs: int = epochs
+        self.stats: TargetStats = stats
+        self.config: Config = config
         self.device: torch.device = device
-        self.output_dir: str = output_dir
+        self.checkpoint_path: Path = output_dir / CHECKPOINT_NAME
 
-        os.makedirs(path_weights, exist_ok=True)
-        os.makedirs(output_dir, exist_ok=True)
-        self.path_weights: str = os.path.join(path_weights, f"{model_name}.pt")
+        train_cfg = config.training
+        self.epochs: int = train_cfg.epochs
+        self.grad_clip_norm: float = train_cfg.grad_clip_norm
+        self.num_targets: int = len(config.data.target_indices)
+        self.target_names: tuple[str, ...] = TARGET_NAMES
 
-        self.train_loader: DataLoader = DataLoader(
-            self.train_dataset, batch_size=batch_size, shuffle=True
+        self.train_loader: DataLoader = make_loader(
+            train_dataset, train_cfg.batch_size, True, config.data.num_workers, seed
         )
-        self.val_loader: DataLoader = DataLoader(
-            self.val_dataset, batch_size=batch_size, shuffle=True
-        )
-
-        self.target_indices: list[int] = target_indices
-        self.num_targets: int = len(target_indices)
-        self.target_names: list[str] = (
-            target_names
-            if target_names is not None
-            else [f"target_{i}" for i in target_indices]
+        self.val_loader: DataLoader = make_loader(
+            val_dataset, train_cfg.batch_size, False, config.data.num_workers
         )
 
-        self.optimizer: Adam = Adam(self.model.parameters(), lr=self.lr)
-        self.criterion: nn.L1Loss = nn.L1Loss()
-        self.scheduler: CosineAnnealingLR = CosineAnnealingLR(
-            self.optimizer, T_max=self.epochs
+        self.criterion: nn.Module = build_loss(train_cfg.loss)
+        self.optimizer: Adam = Adam(
+            self.model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
         )
-        self.early_stopping: EarlyStopping = EarlyStopping(
-            patience=patience, delta=delta
-        )
+        self.scheduler: CosineAnnealingLR = CosineAnnealingLR(self.optimizer, T_max=self.epochs)
+        self.early_stopping: EarlyStopping = EarlyStopping(train_cfg.patience, train_cfg.min_delta)
+        self.writer: SummaryWriter = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
 
-        self.writer: SummaryWriter = SummaryWriter(
-            log_dir=f"{self.output_dir}/{self.model_name}"
-        )
-
-    def _train_epoch(self) -> tuple[float, list[float]]:
-        """Run one full training epoch.
+    def _train_epoch(self) -> tuple[float, torch.Tensor]:
+        """One pass over the training set.
 
         Returns:
-            Tuple of (mean combined loss, list of per-target mean MAEs).
+            Sample-weighted mean training loss and per-target training MAE
+            (computed with the model in train mode, i.e. batch-norm batch stats).
         """
         self.model.train()
-        self.model.to(self.device)
-        n_batches: int = 0
-        losses: list[float] = []
-        per_target_losses: list[torch.Tensor] = []
+        mae: MAEAccumulator = MAEAccumulator(self.num_targets)
+        loss_sum: float = 0.0
 
         for batch in self.train_loader:
-            self.optimizer.zero_grad()
+            batch = batch.to(self.device, non_blocking=True)
+            self.optimizer.zero_grad(set_to_none=True)
 
-            batch = batch.to(self.device)
-            output: torch.Tensor = self.model(batch)
-            targets: torch.Tensor = batch.y[:, self.target_indices]
-            loss: torch.Tensor = self.criterion(output, targets)
-
+            predictions: torch.Tensor = self.model(batch)
+            loss: torch.Tensor = self.criterion(predictions, batch.y)
             loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
             self.optimizer.step()
 
-            losses.append(loss.item())
-            # Per-target MAE for this batch: shape [num_targets]
-            batch_per_target: torch.Tensor = torch.abs(output - targets).mean(dim=0)
-            per_target_losses.append(batch_per_target.detach().cpu())
-            n_batches += 1
+            loss_sum += loss.item() * batch.num_graphs
+            mae.update(predictions, batch.y)
 
-        # Average per-target MAEs across batches
-        stacked: torch.Tensor = torch.stack(
-            per_target_losses
-        )  # [n_batches, num_targets]
-        mean_per_target: list[float] = stacked.mean(dim=0).tolist()
+        return loss_sum / mae.count, mae.per_target()
 
-        return sum(losses) / n_batches, mean_per_target
-
-    def _evaluate(self, loader: DataLoader) -> tuple[float, list[float]]:
-        """Evaluate the model on a dataset split.
-
-        Args:
-            loader: DataLoader for the split to evaluate.
-
-        Returns:
-            Tuple of (mean combined MAE, list of per-target mean MAEs).
-        """
+    @torch.no_grad()
+    def evaluate(self, loader: DataLoader) -> torch.Tensor:
+        """Per-target MAE (normalised units) of the current model on ``loader``."""
         self.model.eval()
-        self.model.to(self.device)
-        losses: list[float] = []
-        per_target_losses: list[torch.Tensor] = []
-        n_batches: int = 0
+        mae: MAEAccumulator = MAEAccumulator(self.num_targets)
+        for batch in loader:
+            batch = batch.to(self.device, non_blocking=True)
+            mae.update(self.model(batch), batch.y)
+        return mae.per_target()
 
-        with torch.no_grad():
-            for batch in loader:
-                batch = batch.to(self.device)
+    def _log_epoch(
+        self, epoch: int, train_loss: float, train_mae: torch.Tensor, val_mae: torch.Tensor
+    ) -> None:
+        lr: float = self.optimizer.param_groups[0]["lr"]
+        self.writer.add_scalar("loss/train", train_loss, epoch)
+        self.writer.add_scalar("mae/train", float(train_mae.mean()), epoch)
+        self.writer.add_scalar("mae/val", float(val_mae.mean()), epoch)
+        self.writer.add_scalar("lr", lr, epoch)
+        for i, name in enumerate(self.target_names):
+            self.writer.add_scalar(f"mae_train/{name}", float(train_mae[i]), epoch)
+            self.writer.add_scalar(f"mae_val/{name}", float(val_mae[i]), epoch)
 
-                output: torch.Tensor = self.model(batch)
-                targets: torch.Tensor = batch.y[:, self.target_indices]
-                loss: torch.Tensor = self.criterion(output, targets)
+    def fit(self) -> History:
+        """Train for ``epochs`` epochs (or until early stopping).
 
-                losses.append(loss.item())
-                batch_per_target: torch.Tensor = torch.abs(output - targets).mean(dim=0)
-                per_target_losses.append(batch_per_target.cpu())
-                n_batches += 1
-
-        stacked: torch.Tensor = torch.stack(per_target_losses)
-        mean_per_target: list[float] = stacked.mean(dim=0).tolist()
-
-        return sum(losses) / n_batches, mean_per_target
-
-    def fit(self) -> dict[str, list[float] | dict[str, list[float]]]:
-        """Run the full training loop for all epochs.
-        Logs train loss and val MAE to TensorBoard at each epoch.
-        Saves the best model checkpoint based on val MAE.
+        The checkpoint on disk is only ever overwritten by a better validation
+        MAE, and the best weights are loaded back into the model at the end, so
+        any evaluation after ``fit`` uses the selected model, not the last one.
 
         Returns:
-            Dictionary with keys:
-                'train_loss'            – list of combined train losses per epoch
-                'val_loss'              – list of combined val MAEs per epoch
-                'train_loss_per_target' – dict mapping target name -> list of per-epoch losses
-                'val_loss_per_target'   – dict mapping target name -> list of per-epoch MAEs
+            Per-epoch curves: train loss, train/val MAE (combined and per target),
+            learning rate, plus the best epoch and training time.
         """
-        results: dict[str, list[float] | dict[str, list[float]]] = {
+        history: History = {
             "train_loss": [],
-            "val_loss": [],
-            "train_loss_per_target": {name: [] for name in self.target_names},
-            "val_loss_per_target": {name: [] for name in self.target_names},
+            "train_mae": [],
+            "val_mae": [],
+            "lr": [],
+            "train_mae_per_target": {name: [] for name in self.target_names},
+            "val_mae_per_target": {name: [] for name in self.target_names},
         }
+        best_epoch: int = -1
+        start: float = time.perf_counter()
 
-        for epoch in range(self.epochs):
-            avg_train_loss: float
-            train_per_target: list[float]
-            avg_train_loss, train_per_target = self._train_epoch()
+        for epoch in range(1, self.epochs + 1):
+            train_loss, train_mae = self._train_epoch()
+            val_mae: torch.Tensor = self.evaluate(self.val_loader)
+            val_combined: float = float(val_mae.mean())
 
-            avg_val_loss: float
-            val_per_target: list[float]
-            avg_val_loss, val_per_target = self._evaluate(self.val_loader)
+            history["train_loss"].append(train_loss)
+            history["train_mae"].append(float(train_mae.mean()))
+            history["val_mae"].append(val_combined)
+            history["lr"].append(self.optimizer.param_groups[0]["lr"])
+            for i, name in enumerate(self.target_names):
+                history["train_mae_per_target"][name].append(float(train_mae[i]))
+                history["val_mae_per_target"][name].append(float(val_mae[i]))
+            self._log_epoch(epoch, train_loss, train_mae, val_mae)
 
-            print(
-                f"Epoch {epoch + 1}/{self.epochs} — "
-                f"Train Loss: {avg_train_loss:.4f} — "
-                f"Val Loss: {avg_val_loss:.4f}"
+            improved: bool = self.early_stopping.step(val_combined)
+            if improved:
+                best_epoch = epoch
+                save_checkpoint(
+                    self.checkpoint_path,
+                    self.model,
+                    self.model_name,
+                    self.config,
+                    self.stats,
+                    epoch,
+                    val_combined,
+                )
+
+            logger.info(
+                "%s | epoch %d/%d | train loss %.4f | val MAE %.4f%s",
+                self.model_name,
+                epoch,
+                self.epochs,
+                train_loss,
+                val_combined,
+                " *" if improved else "",
             )
 
-            results["train_loss"].append(avg_train_loss)
-            results["val_loss"].append(avg_val_loss)
-
-            for i, name in enumerate(self.target_names):
-                results["train_loss_per_target"][name].append(train_per_target[i])
-                results["val_loss_per_target"][name].append(val_per_target[i])
-
-            self.writer.add_scalar("Loss/train", avg_train_loss, epoch)
-            self.writer.add_scalar("Loss/val", avg_val_loss, epoch)
-            for i, name in enumerate(self.target_names):
-                self.writer.add_scalar(f"Loss_train/{name}", train_per_target[i], epoch)
-                self.writer.add_scalar(f"Loss_val/{name}", val_per_target[i], epoch)
-
             self.scheduler.step()
-
-            self.early_stopping(avg_val_loss, self.model, self.path_weights)
-
-            if self.early_stopping.apply_early_stop:
-                print(f"Early stopping triggered at epoch {epoch + 1}.")
+            if self.early_stopping.should_stop:
+                logger.info("Early stopping at epoch %d (best: %d).", epoch, best_epoch)
                 break
 
-        if not self.early_stopping.apply_early_stop:
-            save_parameters(self.model, self.path_weights)
-
+        self._restore_best()
         self.writer.close()
-        return results
 
-    def evaluate_test(self, test_dataset: Dataset) -> tuple[float, list[float]]:
-        """Evaluate the best saved checkpoint on the test set.
+        history["best_epoch"] = best_epoch
+        history["train_seconds"] = time.perf_counter() - start
+        return history
 
-        Args:
-            test_dataset: Test dataset.
-
-        Returns:
-            Tuple of (mean combined MAE, list of per-target MAEs).
-        """
-        test_loader: DataLoader = DataLoader(test_dataset, batch_size=self.batch_size)
-        return self._evaluate(test_loader)
+    def _restore_best(self) -> None:
+        """Load the best checkpoint back into the in-memory model."""
+        payload: dict = torch.load(
+            self.checkpoint_path, map_location=self.device, weights_only=True
+        )
+        self.model.load_state_dict(payload["state_dict"])

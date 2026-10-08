@@ -6,10 +6,13 @@
 #   GPUS="0 1 2 3" JOBS_PER_GPU=2 scripts/dgx_train.sh
 #
 # Environment variables:
-#   GPUS          GPU indices you are allowed to use (default: "0"). On a shared
-#                 machine, check `nvidia-smi` and only list free GPUs.
-#   JOBS_PER_GPU  Concurrent trainings per GPU (default: 2). These models are small
-#                 and partly data-loader bound, so two runs per GPU improve utilisation.
+#   GPUS          GPU indices or MIG UUIDs you are allowed to use (default: "0").
+#                 On a shared machine, check `nvidia-smi -L` and only list your devices.
+#                 If the GPUs are partitioned with MIG, a plain index does not work:
+#                 list the UUIDs, e.g. GPUS="$(nvidia-smi -L | grep -o 'MIG-[0-9a-f-]*')".
+#   JOBS_PER_GPU  Concurrent trainings per device (default: 2). These models are small
+#                 and partly data-loader bound, so two runs per full GPU improve
+#                 utilisation; use 1 on small MIG slices (e.g. 1g).
 #   SEEDS         Training seeds (default: "0 1 2").
 #   MODELS        Models to train (default: all five).
 #   IMAGE         Docker image tag (default: molpred).
@@ -27,14 +30,24 @@ IMAGE=${IMAGE:-molpred}
 
 mkdir -p data outputs/logs results
 
+# Rootless Docker maps container root to the calling user, so files written to the
+# bind mounts already belong to you, and `--user` would fail for UIDs outside the
+# subuid range ("setgroups: invalid argument"). With rootful Docker, run as yourself
+# so the outputs are not owned by root.
+if docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+    USER_FLAGS=()
+else
+    USER_FLAGS=(--user "$(id -u):$(id -g)")
+fi
+
 run_container() {
-    # $1: GPU index; remaining arguments are passed to main.py.
+    # $1: GPU index or MIG UUID; remaining arguments are passed to main.py.
     local gpu=$1
     shift
     docker run --rm \
         --gpus "device=${gpu}" \
         --shm-size=16g \
-        --user "$(id -u):$(id -g)" \
+        ${USER_FLAGS[@]+"${USER_FLAGS[@]}"} \
         -e HOME=/tmp \
         -v "$PWD/data:/app/data" \
         -v "$PWD/outputs:/app/outputs" \

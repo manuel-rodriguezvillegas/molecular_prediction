@@ -3,16 +3,15 @@
 # the comparison, noise ablation and curvature analysis.
 #
 # Usage (from the repository root on the DGX):
+#   scripts/dgx_train.sh                              # auto-detect your devices
 #   GPUS="0 1 2 3" JOBS_PER_GPU=2 scripts/dgx_train.sh
 #
 # Environment variables:
-#   GPUS          GPU indices or MIG UUIDs you are allowed to use (default: "0").
-#                 On a shared machine, check `nvidia-smi -L` and only list your devices.
-#                 If the GPUs are partitioned with MIG, a plain index does not work:
-#                 list the UUIDs, e.g. GPUS="$(nvidia-smi -L | grep -o 'MIG-[0-9a-f-]*')".
-#   JOBS_PER_GPU  Concurrent trainings per device (default: 2). These models are small
-#                 and partly data-loader bound, so two runs per full GPU improve
-#                 utilisation; use 1 on small MIG slices (e.g. 1g).
+#   GPUS          GPU indices or MIG UUIDs to use. Default: every MIG partition shown
+#                 by `nvidia-smi -L` (detected at each launch, since partitions can
+#                 change between sessions), or "0" if the GPUs are not partitioned.
+#   JOBS_PER_GPU  Concurrent trainings per device. Default: 1 on MIG partitions, 2 on
+#                 full GPUs (the models are small and partly data-loader bound).
 #   SEEDS         Training seeds (default: "0 1 2").
 #   MODELS        Models to train (default: all five).
 #   IMAGE         Docker image tag (default: molpred).
@@ -22,8 +21,17 @@
 
 set -euo pipefail
 
-GPUS=(${GPUS:-0})
-JOBS_PER_GPU=${JOBS_PER_GPU:-2}
+# Default devices: the MIG partitions visible to you (they can change between
+# sessions, so detect them every time), or GPU 0 if the GPUs are not partitioned.
+MIG_UUIDS=$(nvidia-smi -L 2>/dev/null | grep -o 'MIG-[0-9a-f-]*' || true)
+if [[ -n "$MIG_UUIDS" ]]; then
+    GPUS=(${GPUS:-$MIG_UUIDS})
+    JOBS_PER_GPU=${JOBS_PER_GPU:-1}  # MIG slices are small: one training each
+else
+    GPUS=(${GPUS:-0})
+    JOBS_PER_GPU=${JOBS_PER_GPU:-2}
+fi
+echo "Devices: ${GPUS[*]} (${JOBS_PER_GPU} job(s) each)"
 SEEDS=(${SEEDS:-0 1 2})
 MODELS=(${MODELS:-GIN GINEdge GINDist EGNNStatic EGNN})
 IMAGE=${IMAGE:-molpred}

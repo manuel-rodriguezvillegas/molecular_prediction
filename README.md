@@ -104,11 +104,14 @@ NVIDIA Container Toolkit.
 
 ```bash
 git clone <repository-url> && cd molecular_prediction
-GPUS="0 1 2 3" JOBS_PER_GPU=2 scripts/dgx_train.sh
+scripts/dgx_train.sh                                  # auto-detects MIG partitions
+GPUS="0 1 2 3" JOBS_PER_GPU=2 scripts/dgx_train.sh    # or choose full GPUs explicitly
 ```
 
 The script builds the image, downloads QM9 once, trains every (model, seed) pair in
-parallel across the listed GPUs, then runs the three analyses. Containers run as your
+parallel across the available devices, then runs the three analyses. Training state is
+saved every epoch, so if the job or session is killed, re-running the same command
+skips finished runs and resumes the interrupted one from its last epoch. Containers run as your
 user, with `data/`, `outputs/` and `results/` bind-mounted, so everything persists on
 the host. Afterwards commit `results/` to bring the numbers and figures back:
 

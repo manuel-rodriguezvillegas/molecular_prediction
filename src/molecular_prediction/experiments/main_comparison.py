@@ -33,8 +33,12 @@ def train_run(
     seed: int,
     splits: QM9Splits,
     device: torch.device,
+    resume: bool = True,
 ) -> dict[str, Any]:
     """Train one (model, seed) pair, evaluate it on test and persist everything.
+
+    An interrupted run is continued from its last completed epoch unless
+    ``resume`` is False.
 
     The checkpoint and TensorBoard logs go to ``outputs/runs/<model>/seed_<seed>/``
     (git-ignored); ``metrics.json`` and ``history.json`` go to
@@ -57,6 +61,7 @@ def train_run(
         device,
         output_dir,
         seed,
+        resume=resume,
     )
     history: dict[str, Any] = trainer.fit()
 
@@ -81,6 +86,7 @@ def train_run(
     }
     save_json(history, results_dir / HISTORY_NAME)
     save_json(metrics, results_dir / METRICS_NAME)
+    trainer.discard_resume_state()  # only once the results are safely on disk
     logger.info("%s seed %d: test MAE %.4f", model_name, seed, metrics["test_mae"])
     return metrics
 
@@ -91,7 +97,11 @@ def train_all(
     device: torch.device,
     overwrite: bool = False,
 ) -> None:
-    """Train every requested (model, seed) pair, skipping finished runs."""
+    """Train every requested (model, seed) pair.
+
+    Finished runs (with ``metrics.json``) are skipped and interrupted ones are
+    resumed; ``overwrite`` retrains everything from scratch.
+    """
     splits: QM9Splits = load_splits(config)
     for model_name in model_names:
         for seed in config.training.seeds:
@@ -99,7 +109,7 @@ def train_all(
             if done.exists() and not overwrite:
                 logger.info("Skipping %s seed %d: already trained.", model_name, seed)
                 continue
-            train_run(config, model_name, seed, splits, device)
+            train_run(config, model_name, seed, splits, device, resume=not overwrite)
 
 
 def aggregate_comparison(config: Config, model_names: list[str]) -> dict[str, Any]:

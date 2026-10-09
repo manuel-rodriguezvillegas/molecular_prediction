@@ -6,8 +6,10 @@ differences in training code.
 """
 
 import logging
+import os
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -27,6 +29,8 @@ from molecular_prediction.training.checkpoint import (
 from molecular_prediction.training.metrics import MAEAccumulator
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+RESUME_NAME: str = "last.pt"
 
 History = dict[str, list[float] | dict[str, list[float]]]
 
@@ -95,6 +99,13 @@ class EarlyStopping:
     def should_stop(self) -> bool:
         return self.patience is not None and self.stale_epochs >= self.patience
 
+    def state_dict(self) -> dict[str, float | int]:
+        return {"best": self.best, "stale_epochs": self.stale_epochs}
+
+    def load_state_dict(self, state: dict[str, float | int]) -> None:
+        self.best = float(state["best"])
+        self.stale_epochs = int(state["stale_epochs"])
+
 
 class Trainer:
     """Train one model with the shared protocol and keep its best checkpoint.
@@ -109,6 +120,7 @@ class Trainer:
         device: Device to train on.
         output_dir: Run directory (checkpoint and TensorBoard logs).
         seed: Seed of the shuffling order (weights are seeded by the caller).
+        resume: Continue from ``last.pt`` in ``output_dir`` if it exists.
     """
 
     def __init__(
@@ -122,6 +134,7 @@ class Trainer:
         device: torch.device,
         output_dir: Path,
         seed: int,
+        resume: bool = True,
     ) -> None:
         self.model: MolecularGNN = model.to(device)
         self.model_name: str = model_name
@@ -129,6 +142,10 @@ class Trainer:
         self.config: Config = config
         self.device: torch.device = device
         self.checkpoint_path: Path = output_dir / CHECKPOINT_NAME
+        self.resume_path: Path = output_dir / RESUME_NAME
+        self.tensorboard_dir: Path = output_dir / "tensorboard"
+        if not resume:
+            self.resume_path.unlink(missing_ok=True)
 
         train_cfg = config.training
         self.epochs: int = train_cfg.epochs
@@ -149,7 +166,6 @@ class Trainer:
         )
         self.scheduler: CosineAnnealingLR = CosineAnnealingLR(self.optimizer, T_max=self.epochs)
         self.early_stopping: EarlyStopping = EarlyStopping(train_cfg.patience, train_cfg.min_delta)
-        self.writer: SummaryWriter = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
 
     def _train_epoch(self) -> tuple[float, torch.Tensor]:
         """One pass over the training set.
@@ -199,12 +215,57 @@ class Trainer:
             self.writer.add_scalar(f"mae_train/{name}", float(train_mae[i]), epoch)
             self.writer.add_scalar(f"mae_val/{name}", float(val_mae[i]), epoch)
 
+    def _save_resume_state(
+        self, epoch: int, history: History, best_epoch: int, train_seconds: float
+    ) -> None:
+        """Persist everything needed to continue exactly after ``epoch``.
+
+        Written to a temporary file and atomically renamed, so a job killed
+        mid-write never leaves a corrupt state behind.
+        """
+        state: dict[str, Any] = {
+            "epoch": epoch,
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "early_stopping": self.early_stopping.state_dict(),
+            "history": history,
+            "best_epoch": best_epoch,
+            "train_seconds": train_seconds,
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            "loader_rng": self.train_loader.generator.get_state(),
+        }
+        tmp_path: Path = self.resume_path.with_suffix(".tmp")
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, self.resume_path)
+
+    def _load_resume_state(self) -> tuple[int, History, int, float]:
+        """Restore the state saved by :meth:`_save_resume_state`."""
+        state: dict[str, Any] = torch.load(
+            self.resume_path, map_location=self.device, weights_only=True
+        )
+        self.model.load_state_dict(state["model"])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+        self.early_stopping.load_state_dict(state["early_stopping"])
+        torch.set_rng_state(state["torch_rng"].cpu())
+        if torch.cuda.is_available() and len(state["cuda_rng"]) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda_rng"]])
+        self.train_loader.generator.set_state(state["loader_rng"].cpu())
+        return state["epoch"], state["history"], state["best_epoch"], state["train_seconds"]
+
     def fit(self) -> History:
-        """Train for ``epochs`` epochs (or until early stopping).
+        """Train for ``epochs`` epochs (or until early stopping), resuming if possible.
 
         The checkpoint on disk is only ever overwritten by a better validation
         MAE, and the best weights are loaded back into the model at the end, so
         any evaluation after ``fit`` uses the selected model, not the last one.
+
+        After every epoch the full training state (weights, optimiser, schedule,
+        early stopping, curves, random generators) is saved to ``last.pt``. If
+        the job is killed, calling ``fit`` again continues from the last
+        completed epoch with the same data order.
 
         Returns:
             Per-epoch curves: train loss, train/val MAE (combined and per target),
@@ -219,9 +280,22 @@ class Trainer:
             "val_mae_per_target": {name: [] for name in self.target_names},
         }
         best_epoch: int = -1
-        start: float = time.perf_counter()
+        done_epochs: int = 0
+        previous_seconds: float = 0.0
+        if self.resume_path.exists():
+            done_epochs, history, best_epoch, previous_seconds = self._load_resume_state()
+            logger.info("%s: resuming after epoch %d.", self.model_name, done_epochs)
 
-        for epoch in range(1, self.epochs + 1):
+        # purge_step drops TensorBoard events logged after the resumed epoch.
+        self.writer: SummaryWriter = SummaryWriter(
+            log_dir=str(self.tensorboard_dir), purge_step=done_epochs + 1 if done_epochs else None
+        )
+        start: float = time.perf_counter()
+        stopped: bool = self.early_stopping.should_stop
+
+        for epoch in range(done_epochs + 1, self.epochs + 1):
+            if stopped:
+                break
             train_loss, train_mae = self._train_epoch()
             val_mae: torch.Tensor = self.evaluate(self.val_loader)
             val_combined: float = float(val_mae.mean())
@@ -259,16 +333,22 @@ class Trainer:
             )
 
             self.scheduler.step()
-            if self.early_stopping.should_stop:
+            elapsed: float = previous_seconds + time.perf_counter() - start
+            self._save_resume_state(epoch, history, best_epoch, elapsed)
+            stopped = self.early_stopping.should_stop
+            if stopped:
                 logger.info("Early stopping at epoch %d (best: %d).", epoch, best_epoch)
-                break
 
         self._restore_best()
         self.writer.close()
 
         history["best_epoch"] = best_epoch
-        history["train_seconds"] = time.perf_counter() - start
+        history["train_seconds"] = previous_seconds + time.perf_counter() - start
         return history
+
+    def discard_resume_state(self) -> None:
+        """Delete ``last.pt`` once the run's results have been saved."""
+        self.resume_path.unlink(missing_ok=True)
 
     def _restore_best(self) -> None:
         """Load the best checkpoint back into the in-memory model."""

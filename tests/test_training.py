@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 import torch
 from torch_geometric.data import Data
 
@@ -62,3 +63,41 @@ def test_trainer_restores_and_persists_the_best_model(small_config: Config, tmp_
     batch = next(iter(val_loader))
     with torch.no_grad():
         torch.testing.assert_close(reloaded(batch), trainer.model(batch))
+
+
+class _Interrupted(Exception):
+    """Stands in for the job being killed."""
+
+
+def test_interrupted_training_resumes_identically(small_config: Config, tmp_path: Path) -> None:
+    """Killing a run after epoch 2 and relaunching gives exactly the uninterrupted result."""
+    small_config.training.epochs = 4
+    small_config.training.batch_size = 8
+    molecules: list[Data] = [random_molecule(6 + i % 4, seed=i) for i in range(48)]
+    train, val = molecules[:32], molecules[32:]
+    stats: TargetStats = TargetStats(mean=torch.zeros(4), std=torch.ones(4))
+
+    def make_trainer(output_dir: Path) -> Trainer:
+        torch.manual_seed(0)
+        model = build_model("EGNN", small_config)
+        return Trainer(
+            model, "EGNN", train, val, stats, small_config, torch.device("cpu"), output_dir, seed=0
+        )
+
+    reference = make_trainer(tmp_path / "reference").fit()
+
+    interrupted: Trainer = make_trainer(tmp_path / "resumed")
+    save_state = interrupted._save_resume_state
+
+    def save_then_die(epoch: int, *args: object) -> None:
+        save_state(epoch, *args)
+        if epoch == 2:
+            raise _Interrupted
+
+    interrupted._save_resume_state = save_then_die
+    with pytest.raises(_Interrupted):
+        interrupted.fit()
+
+    resumed = make_trainer(tmp_path / "resumed").fit()  # fresh process, same directory
+    assert resumed["val_mae"] == reference["val_mae"]
+    assert resumed["best_epoch"] == reference["best_epoch"]

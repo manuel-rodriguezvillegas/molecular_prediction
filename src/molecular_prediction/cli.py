@@ -7,6 +7,8 @@ Examples:
     python main.py compare
     python main.py noise
     python main.py curvature
+    python main.py curvature --heavy-atoms   # curvature of the hydrogen-free skeleton
+    python main.py plots                     # redraw every figure from results/*.json
     python main.py all --smoke          # 2-epoch end-to-end check on a tiny subset
 """
 
@@ -16,13 +18,23 @@ from pathlib import Path
 
 from molecular_prediction.config import MODEL_NAMES, Config
 from molecular_prediction.data.dataset import load_splits
+from molecular_prediction.experiments import plotting
 from molecular_prediction.experiments.curvature_analysis import run_curvature_analysis
 from molecular_prediction.experiments.main_comparison import aggregate_comparison, train_all
 from molecular_prediction.experiments.noise_ablation import run_noise_ablation
 from molecular_prediction.models import build_model, count_parameters
-from molecular_prediction.training.utils import resolve_device, save_json
+from molecular_prediction.training.utils import load_json, resolve_device, save_json
 
-COMMANDS: tuple[str, ...] = ("params", "data", "train", "compare", "noise", "curvature", "all")
+COMMANDS: tuple[str, ...] = (
+    "params",
+    "data",
+    "train",
+    "compare",
+    "noise",
+    "curvature",
+    "plots",
+    "all",
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -39,6 +51,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, help="Checkpoints, logs, caches.")
     parser.add_argument("--results-dir", type=Path, help="JSON results and figures.")
     parser.add_argument("--overwrite", action="store_true", help="Retrain finished runs.")
+    parser.add_argument(
+        "--heavy-atoms",
+        action="store_true",
+        help="Curvature analysis on the heavy-atom graph (hydrogens removed).",
+    )
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -69,6 +86,7 @@ def build_config(args: argparse.Namespace) -> Config:
         config.paths.output_dir = args.output_dir
     if args.results_dir is not None:
         config.paths.results_dir = args.results_dir
+    config.curvature.heavy_atoms_only = args.heavy_atoms
     return config
 
 
@@ -79,6 +97,25 @@ def print_parameter_counts(config: Config, model_names: list[str]) -> None:
             f"{name:<11} hidden={config.model.hidden_dims[name]:>4}  "
             f"parameters={count_parameters(model):>9,}"
         )
+
+
+def redraw_figures(config: Config, model_names: list[str]) -> None:
+    """Regenerate the figures from the saved JSON results, without checkpoints.
+
+    The curvature histogram needs per-molecule data from the cache, so it is
+    only redrawn by the ``curvature`` command itself.
+    """
+    results: Path = config.paths.results_dir
+    figures: Path = config.paths.figures_dir
+    aggregate_comparison(config, model_names)
+    if (results / "noise_ablation.json").exists():
+        plotting.plot_noise_ablation(load_json(results / "noise_ablation.json"), figures)
+    for suffix in ("", "_heavy"):
+        path: Path = results / f"curvature_analysis{suffix}.json"
+        if path.exists():
+            summary = load_json(path)
+            plotting.plot_mae_by_quantile(summary, figures, suffix)
+            plotting.plot_relative_improvement(summary, figures, suffix)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -93,6 +130,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "params":
         print_parameter_counts(config, models)
+        return
+
+    if args.command == "plots":
+        redraw_figures(config, models)
         return
 
     if args.command == "data":

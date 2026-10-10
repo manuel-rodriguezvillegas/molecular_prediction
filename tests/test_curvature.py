@@ -56,3 +56,17 @@ def test_regression_removes_a_pure_size_effect() -> None:
     result = size_controlled_regression(improvement, min_curvature, num_atoms)
     assert result["severity_coef"] > 5 * result["severity_se"]  # confounded on its own
     assert abs(result["severity_coef_given_size"]) < 3 * result["severity_se_given_size"]
+
+
+def test_sp3_sp3_bond_curvature_depends_on_explicit_hydrogens() -> None:
+    """Ethane: with hydrogens the C-C bond looks like a bottleneck, without them it does not.
+
+    Each carbon has degree 4, so its walk spreads 1/8 on each neighbour; the three
+    hydrogens of one carbon must travel 3 hops to those of the other:
+    W1 = 3/8 + 3 * 3/8 = 3/2, kappa = -1/2. This is why most saturated molecules
+    share a minimum curvature of exactly -0.5 on the all-atom graph.
+    """
+    carbon_carbon: list[tuple[int, int]] = [(0, 1)]
+    hydrogens: list[tuple[int, int]] = [(0, h) for h in (2, 3, 4)] + [(1, h) for h in (5, 6, 7)]
+    assert _curvature(nx.Graph(carbon_carbon + hydrogens), 0, 1) == pytest.approx(-0.5)
+    assert _curvature(nx.Graph(carbon_carbon), 0, 1) == pytest.approx(1.0)

@@ -131,6 +131,15 @@ class CurvatureConfig:
     alpha: float = 0.5  # laziness of the random walk
     num_quantiles: int = 4
     num_processes: int = 8
+    # With explicit hydrogens, every single bond between two sp3 atoms has
+    # curvature exactly -0.5, so the minimum curvature mostly encodes saturation.
+    # The heavy-atom graph (hydrogens removed) measures the skeleton's topology.
+    heavy_atoms_only: bool = False
+
+    @property
+    def suffix(self) -> str:
+        """Appended to result and figure names to keep both variants side by side."""
+        return "_heavy" if self.heavy_atoms_only else ""
 
 
 @dataclass

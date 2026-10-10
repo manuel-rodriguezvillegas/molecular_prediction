@@ -134,13 +134,17 @@ def plot_noise_ablation(summary: dict[str, Any], output_dir: Path) -> None:
             )
         ax.set_xlabel("Noise sigma (Angstrom)")
         ax.set_ylabel(ylabel)
+        # Errors span four orders of magnitude across models: log scale is required.
+        ax.set_yscale("log")
         ax.set_title(key)
         ax.grid(True, alpha=0.3)
     axes.flat[0].legend()
     _save(fig, output_dir, "noise_ablation.png")
 
 
-def plot_curvature_distribution(molecules: dict[str, np.ndarray], output_dir: Path) -> None:
+def plot_curvature_distribution(
+    molecules: dict[str, np.ndarray], output_dir: Path, suffix: str = ""
+) -> None:
     """Histogram of min curvature and its relation to molecule size (the confounder)."""
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     axes[0].hist(molecules["min_curvature"], bins=40, color="#4C72B0", edgecolor="white")
@@ -161,10 +165,10 @@ def plot_curvature_distribution(molecules: dict[str, np.ndarray], output_dir: Pa
     axes[1].set_title("Curvature vs size (confounder)")
     for ax in axes:
         ax.grid(True, alpha=0.3)
-    _save(fig, output_dir, "curvature_distribution.png")
+    _save(fig, output_dir, f"curvature_distribution{suffix}.png")
 
 
-def plot_mae_by_quantile(summary: dict[str, Any], output_dir: Path) -> None:
+def plot_mae_by_quantile(summary: dict[str, Any], output_dir: Path, suffix: str = "") -> None:
     """MAE per bottleneck quantile: combined (normalised) and per target (physical)."""
     models: list[str] = list(summary["mae_by_quantile"])
     labels: list[str] = [f"Q{q}\nn={n}" for q, n in enumerate(summary["quantile_sizes"])]
@@ -184,10 +188,10 @@ def plot_mae_by_quantile(summary: dict[str, Any], output_dir: Path) -> None:
         ax.set_xlabel("Bottleneck quantile (Q0 = least)")
     axes[0].set_ylabel("MAE")
     axes[0].legend(fontsize=8)
-    _save(fig, output_dir, "mae_by_quantile.png")
+    _save(fig, output_dir, f"mae_by_quantile{suffix}.png")
 
 
-def plot_relative_improvement(summary: dict[str, Any], output_dir: Path) -> None:
+def plot_relative_improvement(summary: dict[str, Any], output_dir: Path, suffix: str = "") -> None:
     """Relative improvement over GIN per quantile with paired-bootstrap 95% CIs."""
     improvements: dict[str, list[dict[str, float]]] = summary["relative_improvement"]
     models: list[str] = list(improvements)
@@ -218,4 +222,4 @@ def plot_relative_improvement(summary: dict[str, Any], output_dir: Path) -> None
     ax.set_title("Relative MAE improvement over GIN (combined, 95% bootstrap CI)")
     ax.legend(fontsize=8)
     ax.grid(True, axis="y", alpha=0.3)
-    _save(fig, output_dir, "relative_improvement_by_quantile.png")
+    _save(fig, output_dir, f"relative_improvement_by_quantile{suffix}.png")

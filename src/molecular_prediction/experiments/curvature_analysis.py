@@ -48,8 +48,19 @@ REFERENCE_MODEL: str = "GIN"
 NUM_BOOTSTRAP: int = 1_000
 
 
+def heavy_atom_graph(edge_index: torch.Tensor, is_heavy: torch.Tensor) -> tuple[np.ndarray, int]:
+    """Drop hydrogens and their bonds, relabelling the remaining atoms 0..n-1."""
+    new_index: torch.Tensor = torch.full((len(is_heavy),), -1, dtype=torch.long)
+    new_index[is_heavy] = torch.arange(int(is_heavy.sum()))
+    keep: torch.Tensor = is_heavy[edge_index[0]] & is_heavy[edge_index[1]]
+    return new_index[edge_index[:, keep]].numpy(), int(is_heavy.sum())
+
+
 def compute_test_curvatures(config: Config, test_dataset: Dataset) -> dict[str, np.ndarray]:
     """Curvature summary and size of every test molecule, cached as ``.npz``.
+
+    Curvature is computed on the all-atom graph the models use, or on the
+    heavy-atom skeleton if ``config.curvature.heavy_atoms_only`` is set.
 
     Returns:
         Arrays of length num_test: ``min_curvature``, ``mean_curvature``,
@@ -57,7 +68,7 @@ def compute_test_curvatures(config: Config, test_dataset: Dataset) -> dict[str, 
     """
     cache: Path = config.paths.cache_dir / (
         f"curvature_split{config.data.split_seed}_n{len(test_dataset)}"
-        f"_alpha{config.curvature.alpha}.npz"
+        f"_alpha{config.curvature.alpha}{config.curvature.suffix}.npz"
     )
     if cache.exists():
         logger.info("Loading cached curvatures from %s", cache)
@@ -67,8 +78,13 @@ def compute_test_curvatures(config: Config, test_dataset: Dataset) -> dict[str, 
     num_heavy: list[int] = []
     for i in range(len(test_dataset)):
         data = test_dataset[i]
-        graphs.append((data.edge_index.numpy(), data.num_nodes, config.curvature.alpha))
-        num_heavy.append(int((data.x[:, HYDROGEN_FEATURE] == 0).sum()))
+        is_heavy: torch.Tensor = data.x[:, HYDROGEN_FEATURE] == 0
+        if config.curvature.heavy_atoms_only:
+            edge_index, num_nodes = heavy_atom_graph(data.edge_index, is_heavy)
+        else:
+            edge_index, num_nodes = data.edge_index.numpy(), data.num_nodes
+        graphs.append((edge_index, num_nodes, config.curvature.alpha))
+        num_heavy.append(int(is_heavy.sum()))
 
     logger.info("Computing Ollivier-Ricci curvature for %d molecules...", len(graphs))
     with Pool(config.curvature.num_processes) as pool:
@@ -78,7 +94,7 @@ def compute_test_curvatures(config: Config, test_dataset: Dataset) -> dict[str, 
         "min_curvature": np.array([s.min_curvature for s in summaries]),
         "mean_curvature": np.array([s.mean_curvature for s in summaries]),
         "num_edges": np.array([s.num_edges for s in summaries]),
-        "num_atoms": np.array([g[1] for g in graphs]),
+        "num_atoms": np.array([g[1] for g in graphs]),  # nodes of the analysed graph
         "num_heavy_atoms": np.array(num_heavy),
     }
     cache.parent.mkdir(parents=True, exist_ok=True)
@@ -234,11 +250,13 @@ def run_curvature_analysis(
                 reference - candidate, molecules["min_curvature"], molecules["num_atoms"]
             )
 
-    save_json(summary, config.paths.results_dir / "curvature_analysis.json")
-    plotting.plot_curvature_distribution(molecules, config.paths.figures_dir)
-    plotting.plot_mae_by_quantile(summary, config.paths.figures_dir)
+    suffix: str = config.curvature.suffix
+    summary["graph"] = "heavy_atoms" if config.curvature.heavy_atoms_only else "all_atoms"
+    save_json(summary, config.paths.results_dir / f"curvature_analysis{suffix}.json")
+    plotting.plot_curvature_distribution(molecules, config.paths.figures_dir, suffix)
+    plotting.plot_mae_by_quantile(summary, config.paths.figures_dir, suffix)
     if summary["relative_improvement"]:
-        plotting.plot_relative_improvement(summary, config.paths.figures_dir)
+        plotting.plot_relative_improvement(summary, config.paths.figures_dir, suffix)
     _log_summary(summary)
     return summary
 

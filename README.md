@@ -121,9 +121,56 @@ git add results && git commit -m "Add DGX results" && git push
 
 ## Results
 
-Generated in `results/` after training: `comparison.json`, `noise_ablation.json`,
-`curvature_analysis.json`, per-run `results/runs/<model>/seed_<s>/{metrics,history}.json`
-and the figures in `results/figures/`.
+5 models x 3 seeds, 300 epochs each, on one NVIDIA H200 MIG slice (1g.18gb, ~1 h per run).
+Test MAE, mean ± std over seeds (combined score in normalised units, targets in physical units):
+
+| Model | Params | Combined | mu [D] | alpha [a0^3] | gap [eV] | Cv [cal/mol/K] |
+|---|---|---|---|---|---|---|
+| GIN | 200.7k | 0.1094 ± 0.0002 | 0.397 ± 0.002 | 0.314 ± 0.001 | 0.125 ± 0.001 | 0.154 ± 0.001 |
+| GINEdge | 198.1k | 0.1036 ± 0.0003 | 0.379 ± 0.001 | 0.302 ± 0.004 | 0.117 ± 0.000 | 0.142 ± 0.001 |
+| GINDist | 202.0k | 0.0756 ± 0.0011 | 0.285 ± 0.005 | 0.224 ± 0.002 | 0.086 ± 0.001 | 0.074 ± 0.001 |
+| EGNNStatic | 202.7k | 0.0825 ± 0.0011 | 0.314 ± 0.004 | 0.236 ± 0.005 | 0.093 ± 0.001 | 0.083 ± 0.002 |
+| **EGNN** | 198.8k | **0.0559 ± 0.0021** | **0.184 ± 0.011** | **0.194 ± 0.004** | **0.079 ± 0.000** | **0.065 ± 0.001** |
+
+![Test MAE](results/figures/test_mae.png)
+
+**What each step of the ladder shows** (all differences are far larger than the seed-to-seed spread):
+
+- **Bond types help a little** (GIN → GINEdge: −5% combined).
+- **Bond lengths help a lot** (GINEdge → GINDist: −27%), most for heat capacity (−48%).
+- **With identical information, architecture matters**: EGNNStatic is *worse* than
+  GINDist (+9%). GINE's dedicated edge encoder exploits distances better than EGNN's
+  concatenation of distance features with atom embeddings.
+- **Equivariant coordinate updates give the largest single gain** (EGNNStatic → EGNN:
+  −32%). It is graded by target exactly as physics suggests: dipole moment −41%
+  (normalised), polarisability −18%, heat capacity −22%, HOMO-LUMO gap −15%. On a bond
+  graph, moving coordinates is the only way the model can access bond and dihedral
+  angles, and the dipole is the most direction-dependent property.
+
+**Noise ablation.** GIN and GINEdge are exactly flat (sanity check passed). Every
+geometric model is extremely sensitive: at sigma = 0.05 A, below thermal vibration
+amplitudes, all of them become *worse than the topology-only GIN*, and GINDist's error
+grows by two orders of magnitude. Models trained on exact DFT geometries use distances
+as a high-precision fingerprint; they are not usable on approximate geometries without
+noise-aware training (e.g. denoising / noise augmentation).
+
+![Noise ablation](results/figures/noise_ablation.png)
+
+**Over-squashing.** Quantiles are balanced (2708 molecules each). The relative gain over
+GIN increases mildly with bottleneck severity (EGNN: 47% in Q0 to 51% in Q3; GINDist:
+28% to 34%), but the absolute per-molecule gain shows no curvature effect once molecule
+size is controlled (EGNN: −0.0033 ± 0.0006 without size, −0.0007 ± 0.0008 with size).
+Moreover, with explicit hydrogens every single bond between two sp3 atoms has curvature
+exactly −0.5, so 61% of molecules share the minimum value: on the all-atom graph,
+curvature mostly measures saturation rather than topological bottlenecks. QM9 molecules
+are too small (diameter of a few hops, 4 message-passing layers) for over-squashing to
+show. `python main.py curvature --heavy-atoms` repeats the analysis on the hydrogen-free
+skeleton.
+
+![Relative improvement by quantile](results/figures/relative_improvement_by_quantile.png)
+
+All numbers: `results/comparison.json`, `results/noise_ablation.json`,
+`results/curvature_analysis.json`, per-run metrics and curves in `results/runs/`.
 
 ## References
 

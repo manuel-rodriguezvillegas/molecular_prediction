@@ -134,7 +134,9 @@ def redraw_figures(config: Config, model_names: list[str]) -> None:
     figures: Path = config.paths.figures_dir
     aggregate_comparison(config, model_names)
     if (results / "noise_ablation.json").exists():
-        plotting.plot_noise_ablation(load_json(results / "noise_ablation.json"), figures)
+        noise_summary = load_json(results / "noise_ablation.json")
+        plotting.plot_noise_ablation(noise_summary, figures)
+        plotting.plot_noise_summary(noise_summary, figures)
     for suffix in ("", "_heavy"):
         path: Path = results / f"curvature_analysis{suffix}.json"
         if path.exists():

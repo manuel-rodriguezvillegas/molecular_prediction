@@ -109,4 +109,5 @@ def run_noise_ablation(
 
     save_json(summary, config.paths.results_dir / "noise_ablation.json")
     plotting.plot_noise_ablation(summary, config.paths.figures_dir)
+    plotting.plot_noise_summary(summary, config.paths.figures_dir)
     return summary

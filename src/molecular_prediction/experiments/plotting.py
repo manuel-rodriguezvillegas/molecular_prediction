@@ -45,9 +45,14 @@ def hatch(run: str) -> str | None:
     return "//" if is_noise_trained(run) else None
 
 
-def _save(fig: plt.Figure, output_dir: Path, name: str) -> None:
+def _save(
+    fig: plt.Figure,
+    output_dir: Path,
+    name: str,
+    rect: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
+    fig.tight_layout(rect=rect)
     fig.savefig(output_dir / name, dpi=150)
     plt.close(fig)
 
@@ -108,7 +113,9 @@ def plot_test_mae(summary: dict[str, Any], output_dir: Path) -> None:
     """Test MAE per model: combined (normalised) and each target (physical units)."""
     models: list[str] = list(summary["models"])
     panels: list[str] = ["combined", *TARGET_NAMES]
-    fig, axes = plt.subplots(1, len(panels), figsize=(3.6 * len(panels), 4))
+    # 2 x 3 grid (last cell holds the legend): readable on a printed page.
+    fig, grid = plt.subplots(2, 3, figsize=(13, 8))
+    axes: list[plt.Axes] = list(grid.flat[: len(panels)])
     for ax, panel in zip(axes, panels, strict=True):
         stats: list[dict[str, float]] = [
             summary["models"][m]["test_mae"]
@@ -123,14 +130,19 @@ def plot_test_mae(summary: dict[str, Any], output_dir: Path) -> None:
             capsize=3,
             color=[colour(m) for m in models],
             edgecolor="white",
+            label=models,
         )
         for bar, model in zip(bars, models, strict=True):
             bar.set_hatch(hatch(model))
         unit: str = "normalised" if panel == "combined" else summary["units"][panel]
         ax.set_title(f"{panel} [{unit}]")
-        plt.setp(ax.get_xticklabels(), rotation=40, ha="right", rotation_mode="anchor")
+        ax.set_xticks([])
         ax.grid(True, axis="y", alpha=0.3)
-    axes[0].set_ylabel("Test MAE")
+    for ax in (axes[0], axes[3]):
+        ax.set_ylabel("Test MAE")
+    legend_ax: plt.Axes = grid.flat[-1]
+    legend_ax.axis("off")
+    legend_ax.legend(*axes[0].get_legend_handles_labels(), loc="center", frameon=False)
     _save(fig, output_dir, "test_mae.png")
 
 
@@ -164,8 +176,32 @@ def plot_noise_ablation(summary: dict[str, Any], output_dir: Path) -> None:
         ax.set_yscale("log")
         ax.set_title(key)
         ax.grid(True, alpha=0.3)
-    axes.flat[0].legend()
-    _save(fig, output_dir, "noise_ablation.png")
+    # Curves cross every panel, so the legend goes below the figure.
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False)
+    _save(fig, output_dir, "noise_ablation.png", rect=(0.0, 0.05, 1.0, 1.0))
+
+
+def plot_noise_summary(summary: dict[str, Any], output_dir: Path) -> None:
+    """Single-panel version of the noise ablation: combined MAE vs sigma, every run."""
+    sigmas: np.ndarray = np.array(summary["sigmas"])
+    fig, ax = plt.subplots(figsize=(8.0, 4.2))
+    for model, result in summary["models"].items():
+        ax.plot(
+            sigmas,
+            [s["mean"] for s in result["combined"]],
+            marker="o",
+            markersize=4,
+            label=model,
+            color=colour(model),
+            linestyle=line_style(model),
+        )
+    ax.set_yscale("log")
+    ax.set_xlabel("Test-time coordinate noise sigma (Angstrom)")
+    ax.set_ylabel("Test MAE (normalised, combined)")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False)
+    _save(fig, output_dir, "noise_summary.png")
 
 
 def plot_curvature_distribution(
@@ -176,7 +212,8 @@ def plot_curvature_distribution(
     axes[0].hist(molecules["min_curvature"], bins=40, color="#4C72B0", edgecolor="white")
     axes[0].set_xlabel("Minimum edge Ollivier-Ricci curvature")
     axes[0].set_ylabel("Molecules")
-    axes[0].set_title("Bottleneck severity across test molecules")
+    graph: str = "heavy-atom graph" if suffix == "_heavy" else "all-atom graph"
+    axes[0].set_title(f"Bottleneck severity across test molecules ({graph})")
 
     sizes: np.ndarray = molecules["num_atoms"]
     unique_sizes: np.ndarray = np.unique(sizes)
@@ -188,7 +225,7 @@ def plot_curvature_distribution(
     )
     axes[1].set_xlabel("Number of atoms")
     axes[1].set_ylabel("Minimum curvature")
-    axes[1].set_title("Curvature vs size (confounder)")
+    axes[1].set_title(f"Curvature vs size, the confounder ({graph})")
     for ax in axes:
         ax.grid(True, alpha=0.3)
     _save(fig, output_dir, f"curvature_distribution{suffix}.png")

@@ -19,6 +19,9 @@ same training protocol and a matched parameter budget (~200k):
 | **EGNNStatic** | same as GINDist, EGNN-style MPNN | E(3)-invariant | architecture, at equal information |
 | **EGNN** | + equivariant coordinate updates | E(3)-invariant output, equivariant coordinates | value of equivariance (angular information) |
 
+**Full write-up: [`report/report.pdf`](report/report.pdf)** (methods, results, discussion
+and limitations).
+
 Beyond the benchmark, two analyses probe *why* geometry helps:
 
 1. **Noise ablation**: perturb coordinates at inference time (no retraining). GIN and
@@ -129,20 +132,28 @@ git add results && git commit -m "Add DGX results" && git push
 
 ## Results
 
-5 models x 3 seeds, 300 epochs each, on one NVIDIA H200 MIG slice (1g.18gb, ~1 h per run).
-Test MAE, mean ± std over seeds (combined score in normalised units, targets in physical units):
+5 architectures x 3 seeds, plus two noise-augmented variants x 3 seeds, 300 epochs each,
+on one NVIDIA H200 MIG slice (1g.18gb, ~1 h per run). Test MAE on clean geometries,
+mean ± std over seeds (combined score in normalised units, targets in physical units):
 
 | Model | Params | Combined | mu [D] | alpha [a0^3] | gap [eV] | Cv [cal/mol/K] |
 |---|---|---|---|---|---|---|
 | GIN | 200.7k | 0.1094 ± 0.0002 | 0.397 ± 0.002 | 0.314 ± 0.001 | 0.125 ± 0.001 | 0.154 ± 0.001 |
 | GINEdge | 198.1k | 0.1036 ± 0.0003 | 0.379 ± 0.001 | 0.302 ± 0.004 | 0.117 ± 0.000 | 0.142 ± 0.001 |
 | GINDist | 202.0k | 0.0756 ± 0.0011 | 0.285 ± 0.005 | 0.224 ± 0.002 | 0.086 ± 0.001 | 0.074 ± 0.001 |
+| GINDist+noise0.05 | 202.0k | 0.1027 ± 0.0005 | 0.375 ± 0.003 | 0.296 ± 0.002 | 0.116 ± 0.000 | 0.141 ± 0.001 |
 | EGNNStatic | 202.7k | 0.0825 ± 0.0011 | 0.314 ± 0.004 | 0.236 ± 0.005 | 0.093 ± 0.001 | 0.083 ± 0.002 |
-| **EGNN** | 198.8k | **0.0559 ± 0.0021** | **0.184 ± 0.011** | **0.194 ± 0.004** | **0.079 ± 0.000** | **0.065 ± 0.001** |
+| **EGNN** | 198.8k | 0.0559 ± 0.0021 | 0.184 ± 0.011 | **0.194 ± 0.004** | **0.079 ± 0.000** | **0.065 ± 0.001** |
+| **EGNN+noise0.05** | 198.8k | **0.0553 ± 0.0032** | **0.162 ± 0.016** | 0.216 ± 0.005 | 0.085 ± 0.003 | 0.085 ± 0.003 |
+
+`+noise0.05`: trained with Gaussian noise of 0.05 A added to the coordinates of every
+training batch; validation and test use clean geometries.
 
 ![Test MAE](results/figures/test_mae.png)
 
-**What each step of the ladder shows** (all differences are far larger than the seed-to-seed spread):
+### 1. Each step of the ladder
+
+All differences are far larger than the seed-to-seed spread.
 
 - **Bond types help a little** (GIN → GINEdge: −5% combined).
 - **Bond lengths help a lot** (GINEdge → GINDist: −27%), most for heat capacity (−48%).
@@ -151,34 +162,52 @@ Test MAE, mean ± std over seeds (combined score in normalised units, targets in
   concatenation of distance features with atom embeddings.
 - **Equivariant coordinate updates give the largest single gain** (EGNNStatic → EGNN:
   −32%). It is graded by target exactly as physics suggests: dipole moment −41%
-  (normalised), polarisability −18%, heat capacity −22%, HOMO-LUMO gap −15%. On a bond
+  (normalised), heat capacity −22%, polarisability −18%, HOMO-LUMO gap −15%. On a bond
   graph, moving coordinates is the only way the model can access bond and dihedral
   angles, and the dipole is the most direction-dependent property.
 
-**Noise ablation.** GIN and GINEdge are exactly flat (sanity check passed). Every
-geometric model is extremely sensitive: at sigma = 0.05 A, below thermal vibration
-amplitudes, all of them become *worse than the topology-only GIN*, and GINDist's error
-grows by two orders of magnitude. Models trained on exact DFT geometries use distances
-as a high-precision fingerprint; they are not usable on approximate geometries without
-noise-aware training (e.g. denoising / noise augmentation).
+### 2. Robustness to coordinate noise, and what it reveals
 
 ![Noise ablation](results/figures/noise_ablation.png)
 
-**Over-squashing.** Quantiles are balanced (2708 molecules each). The relative gain over
-GIN increases mildly with bottleneck severity (EGNN: 47% in Q0 to 51% in Q3; GINDist:
-28% to 34%), but the absolute per-molecule gain shows no curvature effect once molecule
-size is controlled (EGNN: −0.0033 ± 0.0006 without size, −0.0007 ± 0.0008 with size).
-Moreover, with explicit hydrogens every single bond between two sp3 atoms has curvature
-exactly −0.5, so 61% of molecules share the minimum value: on the all-atom graph,
-curvature mostly measures saturation rather than topological bottlenecks. QM9 molecules
-are too small (diameter of a few hops, 4 message-passing layers) for over-squashing to
-show. `python main.py curvature --heavy-atoms` repeats the analysis on the hydrogen-free
-skeleton.
+- **Sanity check**: GIN and GINEdge are exactly flat.
+- **Models trained on exact geometries are brittle.** At sigma = 0.05 A, below thermal
+  vibration amplitudes, every geometric model becomes *worse than the topology-only GIN*
+  (GINDist: ×210 error, EGNN: ×7).
+- **Noise augmentation fixes robustness, and separates the two geometric models.**
+  - **GINDist+noise0.05 loses its whole advantage on clean data** (0.0756 → 0.1027),
+    falling back to GINEdge (0.1036). The value of distances for GINDist was a
+    sub-0.05 A fingerprint of the exact DFT geometry, not usable geometric information.
+  - **EGNN+noise0.05 keeps it** (0.0559 → 0.0553, within seed noise) and is ~7× more
+    robust at sigma = 0.05 A (0.058 vs 0.396). It stays better than GIN up to
+    sigma ≈ 0.2 A. What EGNN learns from geometry (directions, angles) survives
+    perturbations that destroy precise bond lengths.
+  - The trade-off is target-specific: the dipole moment even improves with noise
+    (−12%, noise acts as a regulariser for the most direction-dependent property), while
+    heat capacity, which depends on precise bond stiffness, degrades most (+32%).
 
-![Relative improvement by quantile](results/figures/relative_improvement_by_quantile.png)
+### 3. Over-squashing (Ollivier-Ricci curvature)
+
+- **All-atom graph (what the models see).** With explicit hydrogens every single bond
+  between two sp3 atoms has curvature exactly −0.5, so 61% of molecules share the minimum
+  value: curvature mostly measures saturation. The relative gain over GIN rises mildly
+  with severity (EGNN 47% → 51%), but the absolute per-molecule gain shows no curvature
+  effect once molecule size is controlled (EGNN: −0.0033 ± 0.0006 without size,
+  −0.0007 ± 0.0008 with size).
+- **Heavy-atom skeleton** (`curvature --heavy-atoms`, size confound much weaker:
+  r = −0.22). Every model's error grows with bottleneck severity (GIN +11% from Q0 to
+  Q3). EGNN's absolute gain over GIN grows slightly and significantly
+  (+0.0022 ± 0.0006 per std of severity, after size control), but its relative gain
+  stays flat at 47–51%.
+- **Conclusion**: at most a weak over-squashing signal. QM9 molecules are too small
+  (graph diameter of a few hops, 4 message-passing layers) for bottlenecks to matter
+  much; the question needs larger molecules.
+
+![Relative improvement by quantile, heavy-atom graph](results/figures/relative_improvement_by_quantile_heavy.png)
 
 All numbers: `results/comparison.json`, `results/noise_ablation.json`,
-`results/curvature_analysis.json`, per-run metrics and curves in `results/runs/`.
+`results/curvature_analysis.json`, `results/curvature_analysis_heavy.json`, and
+per-run metrics and curves in `results/runs/`.
 
 ## References
 

@@ -1,0 +1,24 @@
+{
+  "model_name": "EGNN+noise0.05",
+  "architecture": "EGNN",
+  "train_noise_sigma": 0.05,
+  "seed": 1,
+  "num_parameters": 198824,
+  "best_epoch": 289,
+  "epochs_run": 300,
+  "train_seconds": 4278.895773361903,
+  "best_val_mae": 0.05534645542502403,
+  "test_mae": 0.05472325533628464,
+  "test_mae_per_target": {
+    "mu": 0.10800178349018097,
+    "alpha": 0.02571127563714981,
+    "gap": 0.06473099440336227,
+    "Cv": 0.020448947325348854
+  },
+  "test_mae_physical": {
+    "mu": 0.16253724694252014,
+    "alpha": 0.21041502058506012,
+    "gap": 0.08305665850639343,
+    "Cv": 0.08313075453042984
+  }
+}

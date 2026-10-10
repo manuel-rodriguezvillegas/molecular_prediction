@@ -43,6 +43,7 @@
     "lr": 0.0005,
     "weight_decay": 0.0,
     "loss": "l1",
+    "train_noise_sigma": 0.0,
     "grad_clip_norm": 10.0,
     "patience": 50,
     "min_delta": 0.0001
@@ -63,6 +64,6 @@
     "alpha": 0.5,
     "num_quantiles": 4,
     "num_processes": 8,
-    "heavy_atoms_only": true
+    "heavy_atoms_only": false
   }
 }

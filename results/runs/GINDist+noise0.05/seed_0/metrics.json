@@ -1,0 +1,24 @@
+{
+  "model_name": "GINDist+noise0.05",
+  "architecture": "GINDist",
+  "train_noise_sigma": 0.05,
+  "seed": 0,
+  "num_parameters": 202036,
+  "best_epoch": 293,
+  "epochs_run": 300,
+  "train_seconds": 3355.749611502979,
+  "best_val_mae": 0.10293786972761154,
+  "test_mae": 0.10279620438814163,
+  "test_mae_per_target": {
+    "mu": 0.25032010674476624,
+    "alpha": 0.03620492294430733,
+    "gap": 0.09002137184143066,
+    "Cv": 0.0346384160220623
+  },
+  "test_mae_physical": {
+    "mu": 0.3767191767692566,
+    "alpha": 0.29629257321357727,
+    "gap": 0.1155068650841713,
+    "Cv": 0.14081496000289917
+  }
+}

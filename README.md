@@ -94,6 +94,14 @@ uv run python main.py noise --device cuda          # results/noise_ablation.json
 uv run python main.py curvature --device cuda      # results/curvature_analysis.json
 ```
 
+Noise-augmented variants are trained by adding the training noise to the run name
+(coordinates of every training batch get Gaussian noise of that sigma, in Angstrom;
+validation and test stay clean). The analyses include every finished run by default:
+
+```bash
+uv run python main.py train --models GINDist+noise0.05 EGNN+noise0.05 --device cuda
+```
+
 `train` skips runs whose results already exist, so it can be resumed after an
 interruption (`--overwrite` forces retraining). TensorBoard: `tensorboard --logdir outputs/runs`.
 

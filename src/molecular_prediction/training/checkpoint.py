@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from molecular_prediction.config import Config, ModelConfig
+from molecular_prediction.config import Config, ModelConfig, parse_run_label
 from molecular_prediction.data.dataset import TargetStats
 from molecular_prediction.models import MolecularGNN, build_model
 
@@ -31,7 +31,9 @@ def save_checkpoint(
     """Persist the model weights together with the metadata to rebuild it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
-        "model_name": model_name,
+        "model_name": model_name,  # run label, e.g. "EGNN+noise0.05"
+        "architecture": parse_run_label(model_name)[0],
+        "train_noise_sigma": config.training.train_noise_sigma,
         "model_config": asdict(config.model),
         "target_indices": list(config.data.target_indices),
         "target_stats": stats.to_dict(),
@@ -57,7 +59,9 @@ def load_checkpoint(
     config.model = ModelConfig(**payload["model_config"])
     config.data.target_indices = tuple(payload["target_indices"])
 
-    model: MolecularGNN = build_model(payload["model_name"], config)
+    # Checkpoints written before run labels existed only store "model_name".
+    architecture: str = payload.get("architecture", payload["model_name"])
+    model: MolecularGNN = build_model(architecture, config)
     model.load_state_dict(payload["state_dict"])
     model.to(device).eval()
 

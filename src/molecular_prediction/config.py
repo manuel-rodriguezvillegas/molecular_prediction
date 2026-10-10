@@ -5,6 +5,7 @@ used for the reported results; the command-line interface only overrides the
 handful of fields that change between runs (models, seeds, epochs, paths).
 """
 
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +18,34 @@ TARGET_UNITS: tuple[str, ...] = ("D", "a0^3", "eV", "cal/mol/K")
 # Ordered from least to most geometric information, so that every adjacent
 # pair of models differs in exactly one ingredient.
 MODEL_NAMES: tuple[str, ...] = ("GIN", "GINEdge", "GINDist", "EGNNStatic", "EGNN")
+
+# A run label names an architecture and, optionally, the coordinate noise used
+# during training: "EGNN" or "EGNN+noise0.05" (sigma in Angstrom).
+_RUN_LABEL: re.Pattern[str] = re.compile(
+    r"^(?P<model>[A-Za-z]+)(?:\+noise(?P<sigma>\d+(?:\.\d+)?))?$"
+)
+
+
+def parse_run_label(label: str) -> tuple[str, float]:
+    """Split a run label into (architecture, training noise sigma).
+
+    Raises:
+        ValueError: if the label is malformed or the architecture is unknown.
+    """
+    match: re.Match[str] | None = _RUN_LABEL.match(label)
+    if match is None or match["model"] not in MODEL_NAMES:
+        raise ValueError(
+            f"Invalid run '{label}'. Use a model from {MODEL_NAMES}, "
+            "optionally followed by '+noise<sigma>', e.g. 'EGNN+noise0.05'."
+        )
+    return match["model"], float(match["sigma"] or 0.0)
+
+
+def run_sort_key(label: str) -> tuple[int, float]:
+    """Order runs by architecture (ladder order), then by training noise."""
+    model, sigma = parse_run_label(label)
+    return MODEL_NAMES.index(model), sigma
+
 
 LossName = Literal["l1", "smooth_l1", "mse"]
 
@@ -108,6 +137,10 @@ class TrainingConfig:
     lr: float = 5e-4
     weight_decay: float = 0.0
     loss: LossName = "l1"
+    # Std of the Gaussian noise added to coordinates of every training batch
+    # (Angstrom). Set per run from its label, e.g. "EGNN+noise0.05"; validation
+    # and test always use clean geometries.
+    train_noise_sigma: float = 0.0
     grad_clip_norm: float = 10.0
     # Early stopping on validation MAE; ``None`` disables it. The best
     # checkpoint is always tracked and restored regardless of this value.

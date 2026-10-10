@@ -1,4 +1,8 @@
-"""Figures of every experiment. Error bars are always +-1 std over training seeds."""
+"""Figures of every experiment. Error bars are always +-1 std over training seeds.
+
+Each architecture has a fixed colour; runs trained with coordinate noise
+(e.g. "EGNN+noise0.05") reuse it with dashed lines or hatched bars.
+"""
 
 from pathlib import Path
 from typing import Any
@@ -10,7 +14,7 @@ matplotlib.use("Agg")  # headless: the DGX has no display
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-from molecular_prediction.config import TARGET_NAMES  # noqa: E402
+from molecular_prediction.config import TARGET_NAMES, parse_run_label  # noqa: E402
 
 # One fixed colour per model, from no geometry (grey) to full equivariance (red).
 MODEL_COLOURS: dict[str, str] = {
@@ -20,6 +24,25 @@ MODEL_COLOURS: dict[str, str] = {
     "EGNNStatic": "#DD8452",
     "EGNN": "#C44E52",
 }
+
+
+def colour(run: str) -> str | None:
+    """Colour of a run's architecture (noise-trained variants share it)."""
+    return MODEL_COLOURS.get(parse_run_label(run)[0])
+
+
+def is_noise_trained(run: str) -> bool:
+    return parse_run_label(run)[1] > 0.0
+
+
+def line_style(run: str) -> str:
+    """Dashed lines for noise-trained runs, solid otherwise."""
+    return "--" if is_noise_trained(run) else "-"
+
+
+def hatch(run: str) -> str | None:
+    """Hatched bars for noise-trained runs."""
+    return "//" if is_noise_trained(run) else None
 
 
 def _save(fig: plt.Figure, output_dir: Path, name: str) -> None:
@@ -47,7 +70,9 @@ def _grouped_bars(
             yerr=stds[i],
             capsize=2,
             label=model,
-            color=MODEL_COLOURS.get(model),
+            color=colour(model),
+            hatch=hatch(model),
+            edgecolor="white",
         )
     ax.set_xticks(x, groups)
     ax.grid(True, axis="y", alpha=0.3)
@@ -67,10 +92,8 @@ def plot_training_curves(histories: dict[str, list[dict[str, Any]]], output_dir:
             stacked: np.ndarray = np.array([c[:length] for c in curves])
             epochs: np.ndarray = np.arange(1, length + 1)
             mean, std = stacked.mean(axis=0), stacked.std(axis=0)
-            ax.plot(epochs, mean, label=model, color=MODEL_COLOURS.get(model))
-            ax.fill_between(
-                epochs, mean - std, mean + std, alpha=0.2, color=MODEL_COLOURS.get(model)
-            )
+            ax.plot(epochs, mean, label=model, color=colour(model), linestyle=line_style(model))
+            ax.fill_between(epochs, mean - std, mean + std, alpha=0.2, color=colour(model))
     for ax, panel in zip(axes, panels, strict=True):
         ax.set_title(f"Validation MAE - {panel}")
         ax.set_xlabel("Epoch")
@@ -93,17 +116,19 @@ def plot_test_mae(summary: dict[str, Any], output_dir: Path) -> None:
             else summary["models"][m]["test_mae_physical"][panel]
             for m in models
         ]
-        colours: list[str | None] = [MODEL_COLOURS.get(m) for m in models]
-        ax.bar(
+        bars = ax.bar(
             models,
             [s["mean"] for s in stats],
             yerr=[s["std"] for s in stats],
             capsize=3,
-            color=colours,
+            color=[colour(m) for m in models],
+            edgecolor="white",
         )
+        for bar, model in zip(bars, models, strict=True):
+            bar.set_hatch(hatch(model))
         unit: str = "normalised" if panel == "combined" else summary["units"][panel]
         ax.set_title(f"{panel} [{unit}]")
-        ax.tick_params(axis="x", rotation=45)
+        plt.setp(ax.get_xticklabels(), rotation=40, ha="right", rotation_mode="anchor")
         ax.grid(True, axis="y", alpha=0.3)
     axes[0].set_ylabel("Test MAE")
     _save(fig, output_dir, "test_mae.png")
@@ -130,7 +155,8 @@ def plot_noise_ablation(summary: dict[str, Any], output_dir: Path) -> None:
                 marker="o",
                 capsize=3,
                 label=model,
-                color=MODEL_COLOURS.get(model),
+                color=colour(model),
+                linestyle=line_style(model),
             )
         ax.set_xlabel("Noise sigma (Angstrom)")
         ax.set_ylabel(ylabel)
@@ -213,7 +239,9 @@ def plot_relative_improvement(summary: dict[str, Any], output_dir: Path, suffix:
             yerr=[means[i] - low[i], high[i] - means[i]],
             capsize=2,
             label=model,
-            color=MODEL_COLOURS.get(model),
+            color=colour(model),
+            hatch=hatch(model),
+            edgecolor="white",
         )
     ax.axhline(0.0, color="black", linewidth=0.8)
     ax.set_xticks(x, labels)

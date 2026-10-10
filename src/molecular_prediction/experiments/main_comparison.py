@@ -1,5 +1,6 @@
 """Experiment 1: train every model with several seeds and compare test MAE."""
 
+import copy
 import logging
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,13 @@ from typing import Any
 import numpy as np
 import torch
 
-from molecular_prediction.config import TARGET_NAMES, TARGET_UNITS, Config
+from molecular_prediction.config import (
+    TARGET_NAMES,
+    TARGET_UNITS,
+    Config,
+    parse_run_label,
+    run_sort_key,
+)
 from molecular_prediction.data.dataset import QM9Splits, load_splits
 from molecular_prediction.experiments import plotting
 from molecular_prediction.models import MolecularGNN, build_model, count_parameters
@@ -20,6 +27,19 @@ METRICS_NAME: str = "metrics.json"
 HISTORY_NAME: str = "history.json"
 
 
+def discover_runs(config: Config) -> list[str]:
+    """Labels of every run with at least one finished seed, in ladder order."""
+    root: Path = config.paths.run_results_dir
+    if not root.exists():
+        return []
+    labels: list[str] = [
+        directory.name
+        for directory in root.iterdir()
+        if any(directory.glob(f"seed_*/{METRICS_NAME}"))
+    ]
+    return sorted(labels, key=run_sort_key)
+
+
 def mean_std(values: list[float]) -> dict[str, float]:
     """Mean and sample standard deviation (0 for a single value)."""
     array: np.ndarray = np.asarray(values, dtype=float)
@@ -29,35 +49,40 @@ def mean_std(values: list[float]) -> dict[str, float]:
 
 def train_run(
     config: Config,
-    model_name: str,
+    run_label: str,
     seed: int,
     splits: QM9Splits,
     device: torch.device,
     resume: bool = True,
 ) -> dict[str, Any]:
-    """Train one (model, seed) pair, evaluate it on test and persist everything.
+    """Train one (run, seed) pair, evaluate it on test and persist everything.
 
-    An interrupted run is continued from its last completed epoch unless
-    ``resume`` is False.
+    ``run_label`` is an architecture name, optionally with training noise
+    (e.g. ``"EGNN+noise0.05"``). An interrupted run is continued from its last
+    completed epoch unless ``resume`` is False.
 
-    The checkpoint and TensorBoard logs go to ``outputs/runs/<model>/seed_<seed>/``
+    The checkpoint and TensorBoard logs go to ``outputs/runs/<run>/seed_<seed>/``
     (git-ignored); ``metrics.json`` and ``history.json`` go to
-    ``results/runs/<model>/seed_<seed>/`` (committed).
+    ``results/runs/<run>/seed_<seed>/`` (committed).
     """
-    output_dir: Path = run_dir(config.paths.runs_dir, model_name, seed)
-    results_dir: Path = run_dir(config.paths.run_results_dir, model_name, seed)
+    architecture, train_noise_sigma = parse_run_label(run_label)
+    run_config: Config = copy.deepcopy(config)
+    run_config.training.train_noise_sigma = train_noise_sigma
+
+    output_dir: Path = run_dir(config.paths.runs_dir, run_label, seed)
+    results_dir: Path = run_dir(config.paths.run_results_dir, run_label, seed)
     seed_everything(seed)
-    model: MolecularGNN = build_model(model_name, config)
+    model: MolecularGNN = build_model(architecture, run_config)
     num_parameters: int = count_parameters(model)
-    logger.info("Training %s (seed %d, %d parameters)", model_name, seed, num_parameters)
+    logger.info("Training %s (seed %d, %d parameters)", run_label, seed, num_parameters)
 
     trainer: Trainer = Trainer(
         model,
-        model_name,
+        run_label,
         splits.train,
         splits.val,
         splits.stats,
-        config,
+        run_config,
         device,
         output_dir,
         seed,
@@ -73,7 +98,9 @@ def train_run(
     test_mae_physical: torch.Tensor = test_mae * splits.stats.std
 
     metrics: dict[str, Any] = {
-        "model_name": model_name,
+        "model_name": run_label,
+        "architecture": architecture,
+        "train_noise_sigma": train_noise_sigma,
         "seed": seed,
         "num_parameters": num_parameters,
         "best_epoch": history["best_epoch"],
@@ -87,7 +114,7 @@ def train_run(
     save_json(history, results_dir / HISTORY_NAME)
     save_json(metrics, results_dir / METRICS_NAME)
     trainer.discard_resume_state()  # only once the results are safely on disk
-    logger.info("%s seed %d: test MAE %.4f", model_name, seed, metrics["test_mae"])
+    logger.info("%s seed %d: test MAE %.4f", run_label, seed, metrics["test_mae"])
     return metrics
 
 

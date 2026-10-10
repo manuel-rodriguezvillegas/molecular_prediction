@@ -13,7 +13,8 @@
 #   JOBS_PER_GPU  Concurrent trainings per device. Default: 1 on MIG partitions, 2 on
 #                 full GPUs (the models are small and partly data-loader bound).
 #   SEEDS         Training seeds (default: "0 1 2").
-#   MODELS        Models to train (default: all five).
+#   MODELS        Runs to train (default: the five architectures). A run can add
+#                 training-time coordinate noise: MODELS="GINDist+noise0.05 EGNN+noise0.05".
 #   IMAGE         Docker image tag (default: molpred).
 #
 # Every run is skipped if its results already exist, so the script can be re-launched
@@ -88,10 +89,11 @@ done
 wait
 echo "All trainings finished."
 
+# The analyses cover every finished run (not only the ones trained now), so the
+# noise-trained variants are compared with the original models in one table.
 for command in compare noise curvature; do
     echo "Running ${command}..."
-    run_container "${GPUS[0]}" "$command" --models "${MODELS[@]}" --seeds "${SEEDS[@]}" \
-        --device cuda 2>&1 | tee "outputs/logs/${command}.log"
+    run_container "${GPUS[0]}" "$command" --device cuda 2>&1 | tee "outputs/logs/${command}.log"
 done
 
 echo "Done. Results and figures are in results/ (commit them to the repository)."

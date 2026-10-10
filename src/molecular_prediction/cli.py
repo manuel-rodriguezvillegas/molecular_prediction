@@ -4,6 +4,7 @@ Examples:
     python main.py params
     python main.py data                 # download and process QM9 once
     python main.py train --models GIN EGNN --seeds 0 1 2 --device cuda
+    python main.py train --models EGNN+noise0.05    # train with coordinate-noise augmentation
     python main.py compare
     python main.py noise
     python main.py curvature
@@ -16,11 +17,15 @@ import argparse
 import logging
 from pathlib import Path
 
-from molecular_prediction.config import MODEL_NAMES, Config
+from molecular_prediction.config import MODEL_NAMES, Config, parse_run_label
 from molecular_prediction.data.dataset import load_splits
 from molecular_prediction.experiments import plotting
 from molecular_prediction.experiments.curvature_analysis import run_curvature_analysis
-from molecular_prediction.experiments.main_comparison import aggregate_comparison, train_all
+from molecular_prediction.experiments.main_comparison import (
+    aggregate_comparison,
+    discover_runs,
+    train_all,
+)
 from molecular_prediction.experiments.noise_ablation import run_noise_ablation
 from molecular_prediction.models import build_model, count_parameters
 from molecular_prediction.training.utils import load_json, resolve_device, save_json
@@ -37,12 +42,31 @@ COMMANDS: tuple[str, ...] = (
 )
 
 
+def _run_label(value: str) -> str:
+    """argparse type: accept only well-formed run labels."""
+    try:
+        parse_run_label(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return value
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Geometry-aware GNNs for molecular property prediction on QM9."
     )
     parser.add_argument("command", choices=COMMANDS)
-    parser.add_argument("--models", nargs="+", default=list(MODEL_NAMES), choices=MODEL_NAMES)
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        type=_run_label,
+        metavar="RUN",
+        help=(
+            f"Architectures from {', '.join(MODEL_NAMES)}, optionally trained with "
+            "coordinate noise, e.g. EGNN+noise0.05. Default: the five architectures for "
+            "training, every finished run for the analyses."
+        ),
+    )
     parser.add_argument("--seeds", nargs="+", type=int, help="Training seeds (default: config).")
     parser.add_argument("--device", default="cuda", choices=["cuda", "mps", "cpu"])
     parser.add_argument("--epochs", type=int, help="Override the number of epochs.")
@@ -92,9 +116,10 @@ def build_config(args: argparse.Namespace) -> Config:
 
 def print_parameter_counts(config: Config, model_names: list[str]) -> None:
     for name in model_names:
-        model = build_model(name, config)
+        architecture: str = parse_run_label(name)[0]
+        model = build_model(architecture, config)
         print(
-            f"{name:<11} hidden={config.model.hidden_dims[name]:>4}  "
+            f"{name:<18} hidden={config.model.hidden_dims[architecture]:>4}  "
             f"parameters={count_parameters(model):>9,}"
         )
 
@@ -126,14 +151,18 @@ def main(argv: list[str] | None = None) -> None:
         datefmt="%H:%M:%S",
     )
     config: Config = build_config(args)
-    models: list[str] = list(args.models)
+    requested: list[str] | None = args.models
+
+    def analysis_runs() -> list[str]:
+        # Evaluated lazily: after `all` has trained, the new runs are included.
+        return requested if requested is not None else discover_runs(config)
 
     if args.command == "params":
-        print_parameter_counts(config, models)
+        print_parameter_counts(config, requested or list(MODEL_NAMES))
         return
 
     if args.command == "plots":
-        redraw_figures(config, models)
+        redraw_figures(config, analysis_runs())
         return
 
     if args.command == "data":
@@ -146,13 +175,13 @@ def main(argv: list[str] | None = None) -> None:
     save_json(config.to_dict(), config.paths.results_dir / "config.json")
 
     if args.command in ("train", "all"):
-        train_all(config, models, device, overwrite=args.overwrite)
+        train_all(config, requested or list(MODEL_NAMES), device, overwrite=args.overwrite)
     if args.command in ("compare", "all"):
-        aggregate_comparison(config, models)
+        aggregate_comparison(config, analysis_runs())
     if args.command in ("noise", "all"):
-        run_noise_ablation(config, models, device)
+        run_noise_ablation(config, analysis_runs(), device)
     if args.command in ("curvature", "all"):
-        run_curvature_analysis(config, models, device)
+        run_curvature_analysis(config, analysis_runs(), device)
 
 
 if __name__ == "__main__":

@@ -150,6 +150,7 @@ class Trainer:
         train_cfg = config.training
         self.epochs: int = train_cfg.epochs
         self.grad_clip_norm: float = train_cfg.grad_clip_norm
+        self.train_noise_sigma: float = train_cfg.train_noise_sigma
         self.num_targets: int = len(config.data.target_indices)
         self.target_names: tuple[str, ...] = TARGET_NAMES
 
@@ -180,6 +181,11 @@ class Trainer:
 
         for batch in self.train_loader:
             batch = batch.to(self.device, non_blocking=True)
+            if self.train_noise_sigma > 0.0:
+                # Fresh isotropic noise every step (data augmentation): the model
+                # must predict the properties of the clean molecule from a slightly
+                # wrong geometry, so it cannot rely on DFT-exact distances.
+                batch.pos = batch.pos + self.train_noise_sigma * torch.randn_like(batch.pos)
             self.optimizer.zero_grad(set_to_none=True)
 
             predictions: torch.Tensor = self.model(batch)

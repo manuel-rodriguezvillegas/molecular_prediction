@@ -1,0 +1,67 @@
+{
+  "paths": {
+    "data_dir": "data/qm9",
+    "output_dir": "outputs",
+    "results_dir": "results"
+  },
+  "data": {
+    "target_indices": [
+      0,
+      1,
+      4,
+      11
+    ],
+    "split_sizes": [
+      110000,
+      10000
+    ],
+    "split_seed": 42,
+    "test_size": null,
+    "num_workers": 4
+  },
+  "model": {
+    "hidden_dims": {
+      "GIN": 128,
+      "GINEdge": 122,
+      "GINDist": 122,
+      "EGNNStatic": 82,
+      "EGNN": 76
+    },
+    "num_layers": 4,
+    "num_rbf": 32,
+    "rbf_cutoff": 5.0,
+    "dropout": 0.0
+  },
+  "training": {
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "epochs": 300,
+    "batch_size": 96,
+    "lr": 0.0005,
+    "weight_decay": 0.0,
+    "loss": "l1",
+    "grad_clip_norm": 10.0,
+    "patience": 50,
+    "min_delta": 0.0001
+  },
+  "noise": {
+    "sigmas": [
+      0.0,
+      0.05,
+      0.1,
+      0.25,
+      0.5,
+      1.0
+    ],
+    "num_realisations": 5,
+    "noise_seed": 1234
+  },
+  "curvature": {
+    "alpha": 0.5,
+    "num_quantiles": 4,
+    "num_processes": 8
+  }
+}

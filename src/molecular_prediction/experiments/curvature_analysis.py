@@ -27,13 +27,17 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch_geometric.data import Dataset
+from torch_geometric.data import Batch, Dataset
 
 from molecular_prediction.config import TARGET_NAMES, Config
 from molecular_prediction.data.dataset import HYDROGEN_FEATURE, QM9Splits, load_splits
 from molecular_prediction.experiments import plotting
 from molecular_prediction.experiments.curvature import CurvatureSummary, summarise_molecule
-from molecular_prediction.experiments.evaluation import available_checkpoints, predict
+from molecular_prediction.experiments.evaluation import (
+    available_checkpoints,
+    collate_batches,
+    predict,
+)
 from molecular_prediction.experiments.main_comparison import mean_std
 from molecular_prediction.training.checkpoint import load_checkpoint
 from molecular_prediction.training.utils import save_json
@@ -101,13 +105,13 @@ def assign_quantiles(
 
 
 def per_molecule_errors(
-    config: Config, model_name: str, splits: QM9Splits, device: torch.device
+    config: Config, model_name: str, test_batches: list[Batch], device: torch.device
 ) -> np.ndarray:
     """Absolute errors in normalised units, shape [num_seeds, num_test, num_targets]."""
     errors: list[np.ndarray] = []
     for path in available_checkpoints(config, model_name).values():
         model, _, _ = load_checkpoint(path, device)
-        preds, targets = predict(model, splits.test, config, device)
+        preds, targets = predict(model, test_batches, device)
         errors.append((preds - targets).abs().numpy())
     return np.stack(errors)
 
@@ -177,8 +181,9 @@ def run_curvature_analysis(
     )
     std: np.ndarray = splits.stats.std.numpy()
 
+    test_batches: list[Batch] = collate_batches(splits.test, config.training.batch_size)
     errors: dict[str, np.ndarray] = {
-        name: per_molecule_errors(config, name, splits, device) for name in model_names
+        name: per_molecule_errors(config, name, test_batches, device) for name in model_names
     }
 
     summary: dict[str, Any] = {

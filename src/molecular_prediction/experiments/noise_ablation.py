@@ -20,11 +20,16 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch_geometric.data import Batch
 
 from molecular_prediction.config import TARGET_NAMES, Config
 from molecular_prediction.data.dataset import QM9Splits, load_splits
 from molecular_prediction.experiments import plotting
-from molecular_prediction.experiments.evaluation import available_checkpoints, predict
+from molecular_prediction.experiments.evaluation import (
+    available_checkpoints,
+    collate_batches,
+    predict,
+)
 from molecular_prediction.experiments.main_comparison import mean_std
 from molecular_prediction.training.checkpoint import load_checkpoint
 from molecular_prediction.training.utils import save_json
@@ -40,7 +45,7 @@ def noise_generator(base_seed: int, sigma_index: int, realisation: int) -> torch
 def evaluate_under_noise(
     config: Config,
     model_name: str,
-    splits: QM9Splits,
+    test_batches: list[Batch],
     device: torch.device,
 ) -> dict[int, np.ndarray]:
     """Per-target test MAE of every seed at every sigma.
@@ -60,7 +65,7 @@ def evaluate_under_noise(
             maes: list[np.ndarray] = []
             for r in range(realisations):
                 generator = noise_generator(noise_cfg.noise_seed, sigma_index, r)
-                preds, targets = predict(model, splits.test, config, device, sigma, generator)
+                preds, targets = predict(model, test_batches, device, sigma, generator)
                 maes.append((preds - targets).abs().mean(dim=0).numpy())
             rows.append(np.mean(maes, axis=0))
             logger.info("%s seed %d sigma %.2f: MAE %.4f", model_name, seed, sigma, rows[-1].mean())
@@ -80,11 +85,14 @@ def run_noise_ablation(
         per-target MAE and of the relative degradation MAE(sigma) / MAE(0).
     """
     splits: QM9Splits = load_splits(config)
+    test_batches: list[Batch] = collate_batches(splits.test, config.training.batch_size)
     sigmas: list[float] = list(config.noise.sigmas)
     summary: dict[str, Any] = {"sigmas": sigmas, "models": {}}
 
     for model_name in model_names:
-        per_seed: dict[int, np.ndarray] = evaluate_under_noise(config, model_name, splits, device)
+        per_seed: dict[int, np.ndarray] = evaluate_under_noise(
+            config, model_name, test_batches, device
+        )
         stacked: np.ndarray = np.stack(list(per_seed.values()))  # [seeds, sigmas, targets]
         combined: np.ndarray = stacked.mean(axis=2)  # [seeds, sigmas]
         relative: np.ndarray = combined / combined[:, :1]
